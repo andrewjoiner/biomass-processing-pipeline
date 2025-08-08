@@ -85,22 +85,22 @@ def main():
             
             # Extract key metrics
             processing_summary = result.get('processing_summary', {})
-            biomass_totals = result.get('biomass_totals', {})
-            data_quality = result.get('data_quality', {})
             
             parcels_processed = processing_summary.get('parcels_processed', 0)
             processing_errors = processing_summary.get('processing_errors', 0)
             parcels_per_second = processing_summary.get('parcels_per_second', 0)
             processing_time_hours = processing_time / 3600
             
-            total_biomass = biomass_totals.get('total_biomass_tons', 0)
-            forest_biomass = biomass_totals.get('total_forest_biomass_tons', 0)
-            crop_yield = biomass_totals.get('total_crop_yield_tons', 0)
-            crop_residue = biomass_totals.get('total_crop_residue_tons', 0)
+            # Get biomass totals from processing_summary (where optimized processor puts them)
+            total_biomass = processing_summary.get('total_biomass_tons', 0)
+            forest_biomass = 0  # Will calculate from individual results if needed
+            crop_yield = 0      # Will calculate from individual results if needed
+            crop_residue = 0    # Will calculate from individual results if needed
             
-            avg_confidence = data_quality.get('average_confidence', 0)
-            forest_coverage_rate = data_quality.get('forest_coverage_rate', 0)
-            crop_coverage_rate = data_quality.get('crop_coverage_rate', 0)
+            # Get data quality metrics from processing summary
+            avg_confidence = processing_summary.get('average_confidence', 0)
+            forest_coverage_rate = processing_summary.get('forest_coverage_rate', 0)
+            crop_coverage_rate = processing_summary.get('crop_coverage_rate', 0)
             
             # Log comprehensive results
             logger.info("📊 COMPLETE PROCESSING RESULTS:")
