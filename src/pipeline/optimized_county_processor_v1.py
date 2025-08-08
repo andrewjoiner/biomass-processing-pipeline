@@ -5,6 +5,7 @@ Implements county-level batch processing with proper economies of scale
 """
 
 import gc
+import json
 import logging
 import time
 from datetime import datetime
@@ -225,13 +226,15 @@ class OptimizedCountyProcessor:
                     
                     for record in cdl_records:
                         try:
-                            geom = shape(record['geometry'])
+                            geom = shape(json.loads(record['geometry']))
                             cdl_geometries.append(geom)
                             cdl_data.append({
                                 'crop_code': record['crop_code'],
                                 'area_m2': record['area_m2']
                             })
-                        except:
+                        except Exception as e:
+                            logger.warning(f"Failed to parse CDL geometry for crop {record.get('crop_code', 'unknown')}: {e}")
+                            logger.debug(f"Raw geometry data: {record['geometry'][:100]}...")
                             continue
                     
                     if cdl_geometries:
