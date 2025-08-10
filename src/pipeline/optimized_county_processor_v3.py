@@ -23,6 +23,7 @@ from ..config.database_config_v3 import get_database_queries, CDL_CODES, CROP_BI
 from ..config.processing_config_v3 import get_processing_config
 from ..core.database_manager_v3 import database_manager
 from ..core.blob_manager_v3 import blob_manager
+from .comprehensive_biomass_processor_v3 import ComprehensiveBiomassProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,9 @@ class OptimizedCountyProcessor:
         self.db_manager = database_manager
         self.blob_manager = blob_manager
         self.processing_config = get_processing_config()
+        
+        # Initialize comprehensive processor for individual parcel analysis
+        self.comprehensive_processor = ComprehensiveBiomassProcessor()
         
         # County-level cached data
         self.county_data = {
@@ -352,88 +356,70 @@ class OptimizedCountyProcessor:
     
     def _process_parcel_batch(self, batch_gdf: gpd.GeoDataFrame) -> List[Dict]:
         """
-        Process a batch of parcels using vectorized operations
+        Process a batch of parcels using individual comprehensive parcel analysis
+        Uses the working V3 analyzers instead of placeholder batch logic
         """
         batch_results = []
         
+        logger.debug(f"🔍 Processing batch of {len(batch_gdf)} parcels with V3 comprehensive analysis")
+        
         try:
-            # Vectorized land cover analysis
-            landcover_results = self._analyze_batch_landcover(batch_gdf)
+            # Extract state/county FIPS from the first parcel for comprehensive processor
+            first_row = batch_gdf.iloc[0]
+            state_fips = first_row.get('state_fips', '17')  # Default to Illinois if not found
+            county_fips = first_row.get('county_fips', '113')  # Default to McLean if not found
             
-            # Vectorized crop analysis
-            crop_results = self._analyze_batch_crops(batch_gdf)
-            
-            # Vectorized forest analysis
-            forest_results = self._analyze_batch_forest(batch_gdf)
-            
-            # Combine results for each parcel
+            # Process each parcel individually using comprehensive processor
             for idx, row in batch_gdf.iterrows():
                 parcel_id = row['parcel_id']
                 
-                # Get land cover analysis
-                landcover = landcover_results.get(parcel_id, {})
-                forest_acres = landcover.get('forest_area_acres', 0)
-                cropland_acres = landcover.get('cropland_area_acres', 0)
-                total_acres = row['acres']
+                logger.debug(f"🌿 Processing parcel {parcel_id} with V3 comprehensive analyzers")
                 
-                # Get forest analysis details
-                forest_analysis = forest_results.get(parcel_id, {})
-                forest_biomass = forest_analysis.get('total_biomass_tons', 0)
-                forest_harvestable = forest_analysis.get('harvestable_biomass_tons', 0)
-                forest_residue = forest_analysis.get('residue_tons', 0)
-                
-                # Get crop analysis details
-                crop_analysis = crop_results.get(parcel_id, [])
-                crop_yield = sum(crop.get('yield_tons', 0) for crop in crop_analysis)
-                crop_residue = sum(crop.get('residue_tons', 0) for crop in crop_analysis)
-                
-                parcel_result = {
-                    'parcel_id': parcel_id,
-                    'county_fips': f"{row.get('state_fips', '')}{row.get('county_fips', '')}",  # Add county FIPS
-                    'total_acres': total_acres,
+                # Create parcel dictionary in format expected by comprehensive processor
+                parcel = {
+                    'parcelid': parcel_id,
+                    'geometry': None,  # Will be filled from GeoDataFrame geometry
+                    'postgis_geometry': row.get('postgis_geometry', ''),
+                    'acres': row['acres'],
                     'centroid_lon': row['centroid_lon'],
-                    'centroid_lat': row['centroid_lat'],
-                    'processing_timestamp': datetime.now(),  # Use datetime object instead of string
-                    
-                    # Allocation factors for database
-                    'allocation_factors': {
-                        'forest_acres': forest_acres,
-                        'cropland_acres': cropland_acres,
-                        'other_acres': max(0, total_acres - forest_acres - cropland_acres)
-                    },
-                    
-                    # Land cover data
-                    'landcover_analysis': landcover,
-                    
-                    # Biomass results
-                    'forest_biomass_tons': forest_biomass,
-                    'forest_harvestable_tons': forest_harvestable,
-                    'forest_residue_tons': forest_residue,
-                    'crop_yield_tons': crop_yield,
-                    'crop_residue_tons': crop_residue,
-                    
-                    # Analysis details
-                    'forest_analysis': forest_analysis,
-                    'crop_analysis': crop_analysis,
-                    
-                    # Vegetation indices (placeholder for now)
-                    'vegetation_indices': {
-                        'ndvi': None,
-                        'evi': None,
-                        'savi': None,
-                        'ndwi': None
-                    },
-                    
-                    # Data sources and metadata
-                    'data_sources_used': ['FIA', 'CDL', 'WorldCover'],
-                    'confidence_score': 0.8  # Will implement proper confidence scoring
+                    'centroid_lat': row['centroid_lat']
                 }
                 
-                batch_results.append(parcel_result)
+                # Extract geometry from GeoDataFrame
+                try:
+                    geom = row.geometry
+                    if geom:
+                        # Convert to GeoJSON format expected by analyzers
+                        parcel['geometry'] = geom.__geo_interface__
+                    else:
+                        logger.warning(f"No geometry found for parcel {parcel_id}")
+                        continue
+                except Exception as e:
+                    logger.warning(f"Failed to extract geometry for parcel {parcel_id}: {e}")
+                    continue
                 
+                # Process parcel with comprehensive V3 analysis
+                try:
+                    parcel_result = self.comprehensive_processor.process_single_parcel_comprehensive(
+                        parcel, state_fips, county_fips
+                    )
+                    
+                    if parcel_result:
+                        logger.debug(f"✅ V3 analysis successful for parcel {parcel_id}")
+                        batch_results.append(parcel_result)
+                    else:
+                        logger.debug(f"⚠️ V3 analysis returned no result for parcel {parcel_id}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ V3 analysis failed for parcel {parcel_id}: {e}")
+                    continue
+                    
         except Exception as e:
-            logger.error(f"Error processing parcel batch: {e}")
+            logger.error(f"Error in V3 batch processing: {e}")
+            import traceback
+            traceback.print_exc()
             
+        logger.info(f"🎯 V3 Batch processing complete: {len(batch_results)} successful results from {len(batch_gdf)} parcels")
         return batch_results
     
     def _save_batch_results_to_database(self, batch_results: List[Dict], batch_number: int) -> bool:
@@ -468,134 +454,6 @@ class OptimizedCountyProcessor:
             logger.error(f"❌ Error saving batch {batch_number} to database: {e}")
             return False
     
-    def _analyze_batch_landcover(self, batch_gdf: gpd.GeoDataFrame) -> Dict:
-        """
-        Analyze land cover for batch of parcels using cached WorldCover data
-        """
-        # Simplified landcover analysis - will enhance with actual WorldCover data
-        logger.debug("🌍 Analyzing landcover for batch")
-        
-        landcover_results = {}
-        for idx, row in batch_gdf.iterrows():
-            # Simplified allocation - assume mixed use
-            total_acres = row['acres']
-            forest_acres = total_acres * 0.4  # 40% forest
-            crop_acres = total_acres * 0.3    # 30% crops
-            
-            landcover_results[row['parcel_id']] = {
-                'forest_area_acres': forest_acres,
-                'cropland_area_acres': crop_acres,
-                'total_area_acres': total_acres
-            }
-            
-        return landcover_results
-    
-    def _analyze_batch_crops(self, batch_gdf: gpd.GeoDataFrame) -> Dict:
-        """
-        Analyze crops for batch of parcels using CDL spatial index
-        """
-        crop_results = {}
-        
-        if 'cdl_gdf' not in self.county_data or self.county_data['cdl_gdf'] is None:
-            return crop_results
-        
-        cdl_gdf = self.county_data['cdl_gdf']
-        
-        try:
-            # Perform batch spatial intersection
-            intersections = gpd.overlay(batch_gdf, cdl_gdf, how='intersection')
-            
-            # Group by parcel and aggregate crop data
-            for parcel_id in batch_gdf['parcel_id']:
-                parcel_intersections = intersections[intersections['parcel_id'] == parcel_id]
-                
-                if len(parcel_intersections) == 0:
-                    continue
-                
-                parcel_crops = []
-                for _, intersection in parcel_intersections.iterrows():
-                    crop_code = intersection['crop_code']
-                    intersection_area_m2 = intersection.geometry.area * 111319.9 ** 2  # Approximate conversion
-                    
-                    if crop_code in CROP_BIOMASS_DATA:
-                        crop_data = CROP_BIOMASS_DATA[crop_code]
-                        area_acres = intersection_area_m2 * 0.000247105
-                        
-                        crop_record = {
-                            'crop_code': crop_code,
-                            'crop_name': crop_data['name'],
-                            'area_acres': area_acres,
-                            'yield_tons': area_acres * crop_data['yield_tons_per_acre'],
-                            'residue_tons': area_acres * crop_data['yield_tons_per_acre'] * crop_data['residue_ratio']
-                        }
-                        parcel_crops.append(crop_record)
-                
-                if parcel_crops:
-                    crop_results[parcel_id] = parcel_crops
-                    
-        except Exception as e:
-            logger.error(f"Error in batch crop analysis: {e}")
-        
-        return crop_results
-    
-    def _analyze_batch_forest(self, batch_gdf: gpd.GeoDataFrame) -> Dict:
-        """
-        Analyze forest for batch of parcels using FIA spatial index
-        """
-        forest_results = {}
-        
-        if 'fia_gdf' not in self.county_data or self.county_data['fia_gdf'] is None:
-            return forest_results
-        
-        fia_gdf = self.county_data['fia_gdf']
-        radius_degrees = self.processing_config.get('fia_search_radius_degrees', 0.1)
-        
-        try:
-            # For each parcel, find nearby FIA plots
-            for idx, row in batch_gdf.iterrows():
-                parcel_id = row['parcel_id']
-                parcel_geom = row.geometry
-                parcel_centroid = parcel_geom.centroid
-                
-                # Find FIA plots within search radius
-                parcel_buffer = parcel_centroid.buffer(radius_degrees)
-                nearby_plots = fia_gdf[fia_gdf.intersects(parcel_buffer)]
-                
-                if len(nearby_plots) == 0:
-                    continue
-                
-                # Calculate forest biomass using nearby plots
-                total_biomass = 0
-                plot_count = 0
-                
-                for _, plot in nearby_plots.iterrows():
-                    plot_cn = plot['plot_cn']
-                    
-                    if plot_cn in self.county_data.get('fia_trees_by_plot', {}):
-                        plot_trees = self.county_data['fia_trees_by_plot'][plot_cn]
-                        
-                        plot_biomass = sum(
-                            tree.get('drybio_ag', 0) or 0 
-                            for tree in plot_trees
-                        ) / 2000  # Convert pounds to tons
-                        
-                        total_biomass += plot_biomass
-                        plot_count += 1
-                
-                if plot_count > 0:
-                    # Estimate forest area (placeholder - should use WorldCover data)
-                    estimated_forest_acres = row['acres'] * 0.3  # Assume 30% forest coverage
-                    
-                    forest_results[parcel_id] = {
-                        'total_biomass_tons': total_biomass / plot_count * estimated_forest_acres,
-                        'forest_area_acres': estimated_forest_acres,
-                        'fia_plots_used': plot_count
-                    }
-                    
-        except Exception as e:
-            logger.error(f"Error in batch forest analysis: {e}")
-        
-        return forest_results
     
     def _aggregate_results(self, parcel_results: List[Dict], total_time: float) -> Dict:
         """
