@@ -256,34 +256,59 @@ class CoordinateTransformer:
             List of tiles with intersection information
         """
         intersecting_tiles = []
+        min_lon, min_lat, max_lon, max_lat = wgs84_bounds
+        
+        # Calculate target UTM zone from bounds center
+        center_lon = (min_lon + max_lon) / 2
+        center_lat = (min_lat + max_lat) / 2
+        target_utm_zone = int((center_lon + 180) / 6) + 1
+        
+        # Determine target latitude bands from bounds
+        target_lat_bands = set()
+        for lat in [min_lat, max_lat, center_lat]:
+            if lat < 0:
+                # Southern hemisphere bands (future enhancement)
+                continue
+            elif lat < 24:
+                target_lat_bands.add('Q')  # 16-24N
+            elif lat < 32:
+                target_lat_bands.add('R')  # 24-32N
+            elif lat < 40:
+                target_lat_bands.add('S')  # 32-40N
+            elif lat < 48:
+                target_lat_bands.add('T')  # 40-48N
+            elif lat < 56:
+                target_lat_bands.add('U')  # 48-56N
+            elif lat < 64:
+                target_lat_bands.add('V')  # 56-64N
+        
+        logger.info(f"Target area: UTM zone {target_utm_zone}, latitude bands {target_lat_bands}")
         
         for tile_id in available_tiles:
             try:
                 tile_info = self.parse_sentinel2_tile_id(tile_id)
                 
-                # Simple approach: Check if tile ID suggests it's in the right area
-                # For Utah (Rich County at ~41-42N, ~111W), we expect Zone 12 tiles
-                # MGRS latitude bands: Q=24-32N, R=32-40N, S=40-48N, T=48-56N, U=56-64N
-                # Rich County at 41-42N is in band S (40-48N)
-                
                 zone = tile_info['utm_zone']
-                band = tile_info.get('lat_band') or tile_info.get('utm_band')  # Key name fix
+                band = tile_info.get('lat_band') or tile_info.get('utm_band')
                 
-                # Check if this tile could cover Utah area (Zone 12, band S for 40-48N)
-                if zone == 12 and band in ['S', 'T']:
-                    # This tile is in the right UTM zone and latitude band for Utah
-                    # Add it as potentially intersecting (vegetation analysis will filter further)
+                # Check if tile intersects with target geographic area
+                zone_matches = zone in [target_utm_zone - 1, target_utm_zone, target_utm_zone + 1]
+                band_matches = band in target_lat_bands
+                
+                if zone_matches and band_matches:
                     intersecting_tiles.append({
                         'tile_id': tile_id,
                         'utm_epsg': tile_info['utm_epsg'],
-                        'utm_bounds': None,  # Not calculated for simplicity
-                        'wgs84_bounds': wgs84_bounds  # Use county bounds as approximation
+                        'utm_zone': zone,
+                        'lat_band': band,
+                        'wgs84_bounds': wgs84_bounds
                     })
                     
             except Exception as e:
                 logger.warning(f"Could not process tile {tile_id}: {e}")
                 continue
         
+        logger.info(f"Found {len(intersecting_tiles)} intersecting tiles")
         return intersecting_tiles
     
     def get_worldcover_tiles_for_bounds(self, wgs84_bounds: Tuple[float, float, float, float]) -> List[str]:

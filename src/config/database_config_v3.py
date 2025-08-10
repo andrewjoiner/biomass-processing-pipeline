@@ -144,7 +144,6 @@ def get_database_queries() -> Dict[str, str]:
             AND geometry IS NOT NULL
             AND ST_Area(geography(geometry)) > %s
             ORDER BY parcelid
-            LIMIT %s
         """
     }
 

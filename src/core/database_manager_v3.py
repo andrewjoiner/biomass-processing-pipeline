@@ -159,14 +159,23 @@ class DatabaseManager:
         # Convert minimum acres to square meters for ST_Area(geography(geometry))
         min_acres_val = min_acres or self.processing_config['min_parcel_area_acres']
         min_area_m2 = min_acres_val * 4047  # acres to square meters (0.1 acres = 404.7 m²)
-        limit = limit or 50000  # Default reasonable limit
+        # No artificial limit - process all parcels in county
+        # limit = limit or 50000  # Removed: artificial limit not appropriate for production
         
         with self.get_connection('parcels') as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                self.queries['get_county_parcels_optimized'], 
-                (fips_state, fips_county, min_area_m2, limit)
-            )
+            
+            # Build query dynamically to handle optional limit
+            base_query = self.queries['get_county_parcels_optimized']
+            params = (fips_state, fips_county, min_area_m2)
+            
+            if limit is not None:
+                query = base_query + " LIMIT %s"
+                params = params + (limit,)
+            else:
+                query = base_query
+            
+            cursor.execute(query, params)
             
             parcels = []
             for row in cursor.fetchall():
