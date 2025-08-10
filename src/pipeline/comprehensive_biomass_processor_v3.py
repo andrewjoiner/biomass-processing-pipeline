@@ -363,16 +363,17 @@ class ComprehensiveBiomassProcessor:
             # Step 4: Forest biomass analysis (only if forest land present)
             forest_analysis = None
             if allocation_factors['forest_acres'] > 0.1:  # At least 0.1 acres of forest
-                forest_analysis = self.forest_analyzer.analyze_parcel_forest(
+                forest_record = self.forest_analyzer.analyze_parcel_forest(
                     parcel_geometry, 
                     parcel_postgis_geometry, 
                     allocation_factors['forest_acres'],  # Use actual forest area, not total parcel
                     vegetation_indices
                 )
                 
-                # Apply land cover allocation
-                if forest_analysis:
-                    forest_analysis = self._apply_forest_landcover_allocation(forest_analysis, allocation_factors)
+                # Apply land cover allocation and wrap in list for database manager
+                if forest_record:
+                    forest_record = self._apply_forest_landcover_allocation(forest_record, allocation_factors)
+                    forest_analysis = [forest_record]  # Database manager expects a list
             
             # Step 5: Crop analysis (only if cropland present)
             crop_analysis = None
@@ -400,10 +401,10 @@ class ComprehensiveBiomassProcessor:
                 'crop_analysis': crop_analysis,
                 'vegetation_indices': vegetation_indices,
                 
-                # Summary totals
-                'forest_biomass_tons': forest_analysis.get('total_standing_biomass_tons', 0) if forest_analysis else 0,
-                'forest_harvestable_tons': forest_analysis.get('total_harvestable_biomass_tons', 0) if forest_analysis else 0,
-                'forest_residue_tons': forest_analysis.get('forest_residue_biomass_tons', 0) if forest_analysis else 0,
+                # Summary totals (forest_analysis is now a list)
+                'forest_biomass_tons': forest_analysis[0].get('total_standing_biomass_tons', 0) if forest_analysis and len(forest_analysis) > 0 else 0,
+                'forest_harvestable_tons': forest_analysis[0].get('total_harvestable_biomass_tons', 0) if forest_analysis and len(forest_analysis) > 0 else 0,
+                'forest_residue_tons': forest_analysis[0].get('forest_residue_biomass_tons', 0) if forest_analysis and len(forest_analysis) > 0 else 0,
                 'crop_yield_tons': sum(crop.get('yield_tons', 0) for crop in (crop_analysis or [])),
                 'crop_residue_tons': sum(crop.get('harvestable_residue_tons', 0) for crop in (crop_analysis or [])),
                 
