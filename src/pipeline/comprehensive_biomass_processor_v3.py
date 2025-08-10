@@ -343,6 +343,8 @@ class ComprehensiveBiomassProcessor:
             parcel_postgis_geometry = parcel['postgis_geometry']
             parcel_acres = parcel['acres']
             
+            logger.info(f"🔬 V3 Comprehensive processing parcel {parcel_id}, {parcel_acres:.2f} acres")
+            
             # Step 1: Sub-parcel land cover analysis
             landcover_analysis = self.landcover_analyzer.analyze_parcel_landcover(parcel_geometry, parcel_id)
             
@@ -363,6 +365,7 @@ class ComprehensiveBiomassProcessor:
             # Step 4: Forest biomass analysis (only if forest land present)
             forest_analysis = None
             if allocation_factors['forest_acres'] > 0.1:  # At least 0.1 acres of forest
+                logger.debug(f"Parcel {parcel_id} has {allocation_factors['forest_acres']:.2f} forest acres, analyzing...")
                 forest_record = self.forest_analyzer.analyze_parcel_forest(
                     parcel_geometry, 
                     parcel_postgis_geometry, 
@@ -372,17 +375,24 @@ class ComprehensiveBiomassProcessor:
                 
                 # Apply land cover allocation and wrap in list for database manager
                 if forest_record:
+                    logger.debug(f"Forest record returned for {parcel_id}: biomass_type={forest_record.get('biomass_type')}, area={forest_record.get('area_acres')}")
                     forest_record = self._apply_forest_landcover_allocation(forest_record, allocation_factors)
                     forest_analysis = [forest_record]  # Database manager expects a list
+                else:
+                    logger.debug(f"No forest record returned for {parcel_id}")
             
             # Step 5: Crop analysis (only if cropland present)
             crop_analysis = None
             if allocation_factors['cropland_acres'] > 0.1:  # At least 0.1 acres of cropland
+                logger.debug(f"Parcel {parcel_id} has {allocation_factors['cropland_acres']:.2f} crop acres, analyzing...")
                 crop_records = self.crop_analyzer.analyze_parcel_crops(parcel_postgis_geometry, vegetation_indices)
                 
                 if crop_records:
+                    logger.debug(f"Crop records returned for {parcel_id}: {len(crop_records)} crops")
                     # Apply land cover allocation to crop estimates
                     crop_analysis = self._apply_crop_landcover_allocation(crop_records, allocation_factors)
+                else:
+                    logger.debug(f"No crop records returned for {parcel_id}")
             
             # Step 6: Create comprehensive parcel result
             parcel_result = {
