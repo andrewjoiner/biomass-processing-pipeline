@@ -86,40 +86,42 @@
 ### 2.3 Enhanced Data Extraction (From Existing Calculations)
 
 #### Forest Analyzer V3 Enhancements
-- [ ] Return species breakdown (already calculated in `_calculate_comprehensive_fia_biomass`)
-- [ ] Return stand age (already calculated in `_calculate_weighted_stand_age`)
-- [ ] Return forest type (already calculated in `_determine_dominant_forest_type`)
-- [ ] Return biomass components (bole, branch, foliage - already calculated)
-- [ ] Return harvest probability (already calculated in `_calculate_harvest_probability`)
-- [ ] Return real NDVI from vegetation indices (already passed in)
+- [x] Return species breakdown (already calculated in `_calculate_comprehensive_fia_biomass`)
+- [x] Return stand age (already calculated in `_calculate_weighted_stand_age`)
+- [x] Return forest type (already calculated in `_determine_dominant_forest_type`)
+- [x] Return biomass components (bole, branch, foliage - already calculated)
+- [x] Return harvest probability (already calculated in `_calculate_harvest_probability`)
+- [x] Return real NDVI from vegetation indices (already passed in)
 
 #### Crop Analyzer V3 Enhancements  
-- [ ] Return ALL crop intersections (not just dominant)
-- [ ] Keep multiple crop records per parcel
-- [ ] Include area_acres and area_percentage for each crop
-- [ ] Include CDL confidence scores (already calculated)
-- [ ] Return real NDVI from vegetation indices (already passed in)
+- [x] Return ALL crop intersections (not just dominant)
+- [x] Keep multiple crop records per parcel
+- [x] Include area_acres and area_percentage for each crop
+- [x] Include CDL confidence scores (already calculated)
+- [x] Return real NDVI from vegetation indices (already passed in)
 
 #### Vegetation Analyzer V3 Enhancements
-- [ ] Calculate and return actual NDVI/EVI/SAVI values (not empty)
-- [ ] Return dynamic confidence scores (not hardcoded 0.8)
+- [x] Calculate and return actual NDVI/EVI/SAVI values (not empty)
+- [x] Return dynamic confidence scores (not hardcoded 0.8)
+
+**DISCOVERY**: All analyzers are already calculating and returning enhanced data! V1 saves this as JSON blobs in forest_analysis and crop_analysis columns. V3 needs to extract this data to separate relational tables.
 
 ---
 
 ## Phase 3: Database Schema Enhancement (1 hour)
 
 ### 3.1 Create V3 Database
-- [ ] Connect to Azure PostgreSQL server
-- [ ] Create biomass_v3 database
+- [x] Connect to Azure PostgreSQL server
+- [x] Create biomass_v3 database
   ```sql
   CREATE DATABASE biomass_v3;
   ```
-- [ ] Grant permissions to postgresadmin user
+- [x] Grant permissions to postgresadmin user
 
 ### 3.2 Create Enhanced Tables
 
 #### Forestry Analysis Table
-- [ ] Create forestry_analysis_v3 table
+- [x] Create forestry_analysis_v3 table
   ```sql
   CREATE TABLE forestry_analysis_v3 (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -162,7 +164,7 @@
   ```
 
 #### Crop Analysis Table
-- [ ] Create crop_analysis_v3 table
+- [x] Create crop_analysis_v3 table
   ```sql
   CREATE TABLE crop_analysis_v3 (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -198,7 +200,7 @@
   ```
 
 ### 3.3 Update Database Configuration
-- [ ] Update database_config_v3.py to point to biomass_v3
+- [x] Update database_config_v3.py to point to biomass_v3
   ```python
   'biomass_output': {
       **base_config,
@@ -207,10 +209,10 @@
   ```
 
 ### 3.4 Update Database Manager Save Methods
-- [ ] Implement `save_forestry_analysis_v3()` method
-- [ ] Implement `save_crop_analysis_v3()` method
-- [ ] Use single transaction for both tables per batch
-- [ ] Implement bulk insert for multiple crop rows
+- [x] Implement `save_forestry_analysis_v3()` method
+- [x] Implement `save_crop_analysis_v3()` method
+- [x] Use single transaction for both tables per batch
+- [x] Implement bulk insert for multiple crop rows
 
 ---
 
