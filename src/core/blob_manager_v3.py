@@ -50,6 +50,9 @@ class BlobManager:
         self.sentinel2_cache = {}  # {tile_key: {bands, metadata, bounds}}
         self.worldcover_cache = {}  # {tile_name: {data, metadata, bounds}}
         
+        # County tile index for streaming (metadata only, no tile data)
+        self.county_tile_index = {}  # {tile_id: {blob_paths, bounds, transform}}
+        
         # Performance tracking
         self.stats = {
             'downloads': 0,
@@ -166,6 +169,88 @@ class BlobManager:
             logger.error(f"Failed to read raster from {blob_name}: {e}")
             return None
     
+    def analyze_county_satellite_requirements(self, county_bounds: Tuple[float, float, float, float],
+                                            period: str = 'august') -> Dict:
+        """
+        Analyze satellite data requirements for county without downloading tiles
+        STREAMING ARCHITECTURE: Creates lightweight tile index for on-demand access
+        
+        Args:
+            county_bounds: WGS84 bounds (min_lon, min_lat, max_lon, max_lat)
+            period: Time period ('june', 'august', 'october')
+            
+        Returns:
+            Dictionary with tile analysis results
+        """
+        logger.info(f"Analyzing satellite data requirements for bounds: {county_bounds}")
+        
+        try:
+            from ..core.coordinate_utils_v3 import coordinate_transformer
+            
+            # Get available tiles from blob storage (metadata only)
+            available_tiles = self._get_available_sentinel2_tiles()
+            
+            # Find intersecting tiles using coordinate transformer
+            intersecting_tiles = coordinate_transformer.get_sentinel2_tiles_for_bounds(
+                county_bounds, available_tiles
+            )
+            
+            logger.info(f"Found {len(intersecting_tiles)} tiles required for county bounds")
+            
+            # Build tile index without downloading data
+            tiles_indexed = 0
+            estimated_data_size = 0
+            
+            for tile_info in intersecting_tiles:
+                tile_id = tile_info['tile_id']
+                
+                # Get actual available date for this tile
+                tile_date = self._get_available_date_for_tile(tile_id, period)
+                
+                # Build blob paths for all bands
+                blob_paths = {}
+                for band in self.sentinel2_config['bands']:
+                    blob_paths[band] = self.blob_paths['sentinel2'].format(
+                        period=self.sentinel2_config['periods'][period],
+                        tile_id=tile_id,
+                        date=tile_date,
+                        band=band
+                    )
+                
+                # Store tile metadata in index
+                self.county_tile_index[tile_id] = {
+                    'blob_paths': blob_paths,
+                    'wgs84_bounds': tile_info.get('wgs84_bounds'),
+                    'utm_bounds': tile_info.get('utm_bounds'),
+                    'utm_epsg': tile_info.get('utm_epsg', 4326),
+                    'date': tile_date,
+                    'period': period
+                }
+                
+                tiles_indexed += 1
+                estimated_data_size += 250 * 4  # Estimate 250MB per band × 4 bands
+            
+            analysis_result = {
+                'tiles_required': tiles_indexed,
+                'estimated_data_size_mb': estimated_data_size,
+                'estimated_data_size_gb': estimated_data_size / 1024,
+                'period': period,
+                'county_bounds': county_bounds
+            }
+            
+            logger.info(f"✅ County satellite analysis complete: {tiles_indexed} tiles, "
+                       f"~{estimated_data_size/1024:.1f}GB if downloaded")
+            
+            return analysis_result
+            
+        except Exception as e:
+            logger.error(f"Failed to analyze satellite requirements: {e}")
+            return {
+                'tiles_required': 0,
+                'estimated_data_size_mb': 0,
+                'error': str(e)
+            }
+
     def download_sentinel2_county_tiles(self, county_bounds: Tuple[float, float, float, float],
                                       period: str = 'august') -> Dict:
         """
@@ -357,6 +442,153 @@ class BlobManager:
             logger.error(f"Failed to download WorldCover tile: {tile_name}")
             return None
     
+    def get_sentinel2_data_for_parcel_streaming(self, parcel_geometry: Dict) -> Optional[Dict]:
+        """
+        Stream Sentinel-2 data for a specific parcel without pre-downloading entire tiles
+        STREAMING ARCHITECTURE: Downloads only the pixels needed for the parcel
+        
+        Args:
+            parcel_geometry: GeoJSON geometry dictionary
+            
+        Returns:
+            Dictionary with clipped Sentinel-2 data or None
+        """
+        try:
+            from ..core.coordinate_utils_v3 import coordinate_transformer
+            from shapely.geometry import shape
+            
+            # Convert geometry to shapely
+            geom = shape(parcel_geometry)
+            parcel_bounds = geom.bounds  # WGS84 bounds (min_lon, min_lat, max_lon, max_lat)
+            
+            # Find tiles from our county index that intersect this parcel
+            intersecting_tile_ids = []
+            for tile_id, tile_info in self.county_tile_index.items():
+                if tile_info.get('wgs84_bounds'):
+                    if coordinate_transformer.bounds_intersect(parcel_bounds, tile_info['wgs84_bounds']):
+                        intersecting_tile_ids.append(tile_id)
+            
+            if not intersecting_tile_ids:
+                logger.debug("No indexed tiles found for parcel - index may be empty")
+                return None
+            
+            logger.debug(f"Streaming from {len(intersecting_tile_ids)} indexed tiles for parcel")
+            
+            # Stream data from each intersecting tile
+            all_clipped_bands = {}
+            
+            # Initialize band data containers
+            for band in self.sentinel2_config['bands']:
+                all_clipped_bands[band] = {'data_arrays': [], 'metadata': None}
+            
+            # Process each intersecting tile
+            for tile_id in intersecting_tile_ids:
+                tile_info = self.county_tile_index[tile_id]
+                
+                # Stream each band for this tile
+                for band in self.sentinel2_config['bands']:
+                    blob_path = tile_info['blob_paths'][band]
+                    
+                    try:
+                        # Stream only the needed data from this tile/band
+                        clipped_data = self._stream_parcel_window_from_tile(
+                            blob_path, parcel_geometry, tile_info
+                        )
+                        
+                        if clipped_data is not None:
+                            all_clipped_bands[band]['data_arrays'].append(clipped_data)
+                            if all_clipped_bands[band]['metadata'] is None:
+                                all_clipped_bands[band]['metadata'] = {
+                                    'crs': clipped_data.get('crs', 'EPSG:4326'),
+                                    'nodata': clipped_data.get('nodata', 0)
+                                }
+                                
+                    except Exception as e:
+                        logger.warning(f"Failed to stream {band} from tile {tile_id}: {e}")
+                        continue
+            
+            # Merge data from multiple tiles (use largest array for each band)
+            final_bands = {}
+            for band in self.sentinel2_config['bands']:
+                if all_clipped_bands[band]['data_arrays']:
+                    # Use the array with the most pixels
+                    largest_array = max(all_clipped_bands[band]['data_arrays'], 
+                                      key=lambda x: x['data'].size if x.get('data') is not None else 0)
+                    final_bands[band] = largest_array
+            
+            if not final_bands:
+                logger.debug("No valid Sentinel-2 data streamed for parcel")
+                return None
+            
+            # Return structured result similar to cached approach
+            return {
+                'bands': final_bands,
+                'metadata': all_clipped_bands[list(final_bands.keys())[0]]['metadata'],
+                'source': 'streaming'
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to stream Sentinel-2 data for parcel: {e}")
+            return None
+
+    def _stream_parcel_window_from_tile(self, blob_path: str, parcel_geometry: Dict, 
+                                      tile_info: Dict) -> Optional[Dict]:
+        """
+        Stream only the pixel window needed for a parcel from a Sentinel-2 tile
+        PHASE 1: Uses full tile download and clipping (fallback approach)
+        TODO PHASE 2: Implement true pixel window range requests
+        
+        Args:
+            blob_path: Blob path for the Sentinel-2 band file
+            parcel_geometry: GeoJSON geometry dictionary  
+            tile_info: Tile information with bounds and metadata
+            
+        Returns:
+            Dictionary with clipped raster data or None
+        """
+        try:
+            # PHASE 1 IMPLEMENTATION: Download full tile and clip
+            # This maintains compatibility while we test the architecture
+            blob_data = self.download_blob_to_memory(
+                self.config['containers']['sentinel2'], 
+                blob_path
+            )
+            
+            if not blob_data:
+                logger.debug(f"Could not download blob: {blob_path}")
+                return None
+            
+            # Process the tile data in memory and clip to parcel
+            with MemoryFile(blob_data) as memfile:
+                with memfile.open() as dataset:
+                    # Transform geometry to raster CRS if needed
+                    if dataset.crs != 'EPSG:4326':
+                        from rasterio.warp import transform_geom
+                        transformed_geom = transform_geom('EPSG:4326', dataset.crs, parcel_geometry)
+                    else:
+                        transformed_geom = parcel_geometry
+                    
+                    # Clip raster to geometry
+                    from rasterio.mask import mask
+                    clipped_data, clipped_transform = mask(
+                        dataset, [transformed_geom], crop=True, nodata=dataset.nodata
+                    )
+                    
+                    if clipped_data[0] is not None and clipped_data[0].size > 0:
+                        return {
+                            'data': clipped_data[0],
+                            'transform': clipped_transform,
+                            'crs': dataset.crs,
+                            'nodata': dataset.nodata,
+                            'source_blob': blob_path
+                        }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to stream window from {blob_path}: {e}")
+            return None
+
     def get_sentinel2_data_for_parcel(self, parcel_geometry: Dict) -> Optional[Dict]:
         """
         Get Sentinel-2 data for a specific parcel from cache
