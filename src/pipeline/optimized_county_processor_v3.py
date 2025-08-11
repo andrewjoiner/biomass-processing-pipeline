@@ -183,15 +183,19 @@ class OptimizedCountyProcessor:
             logger.info(f"📊 Tile analysis: {len(required_tiles['sentinel2'])} Sentinel-2 tiles, "
                        f"{len(required_tiles['worldcover'])} WorldCover tiles required")
             
-            # Download satellite tiles for county (CRITICAL FIX for Sentinel-2 data access)
-            logger.info("📡 Pre-downloading satellite tiles for county...")
+            # Analyze satellite data requirements (STREAMING ARCHITECTURE)
+            logger.info("🗂️ Analyzing satellite tile requirements for county...")
             try:
-                sentinel2_stats = self.blob_manager.download_sentinel2_county_tiles(county_bounds)
+                satellite_analysis = self.blob_manager.analyze_county_satellite_requirements(county_bounds)
+                # Still download WorldCover tiles (they're smaller and needed for spatial index)
                 worldcover_stats = self.blob_manager.download_worldcover_county_tiles(county_bounds)
-                logger.info(f"✅ Downloaded {sentinel2_stats['sentinel2_tiles']} Sentinel-2 tiles, "
-                           f"{worldcover_stats['worldcover_tiles']} WorldCover tiles")
+                logger.info(f"✅ Analyzed {satellite_analysis['tiles_required']} Sentinel-2 tiles "
+                           f"(~{satellite_analysis['estimated_data_size_gb']:.1f}GB), "
+                           f"downloaded {worldcover_stats['worldcover_tiles']} WorldCover tiles")
+                logger.info("📡 Sentinel-2 data will be streamed on-demand for each parcel")
             except Exception as e:
-                logger.warning(f"Satellite tile download failed: {e}")
+                logger.warning(f"Satellite analysis failed: {e}")
+                satellite_analysis = {'tiles_required': 0, 'estimated_data_size_gb': 0}
             
             # Store requirements for reference
             self.county_data['required_tiles'] = required_tiles

@@ -439,7 +439,7 @@ class LandCoverAnalyzer:
         """
         try:
             # Try to get Sentinel-2 data for the parcel (function only takes geometry parameter)
-            sentinel_data = self.blob_manager.get_sentinel2_data_for_parcel(parcel_geometry)
+            sentinel_data = self.blob_manager.get_sentinel2_data_for_parcel_streaming(parcel_geometry)
             
             if not sentinel_data:
                 logger.debug(f"No Sentinel-2 data available for parcel {parcel_id}")
@@ -478,7 +478,7 @@ class LandCoverAnalyzer:
                 'vegetation_health': vegetation_health,
                 'forest_correlation': forest_correlation,
                 'crop_correlation': crop_correlation,
-                'acquisition_date': sentinel_data.get('acquisition_date'),
+                'acquisition_date': sentinel_data.get('acquisition_date', datetime.now().isoformat()),
                 'cloud_coverage': sentinel_data.get('cloud_coverage', 0)
             }
             

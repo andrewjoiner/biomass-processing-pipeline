@@ -37,7 +37,7 @@ class VegetationAnalyzer:
         """
         try:
             # Get Sentinel-2 data for parcel
-            sentinel2_data = self.blob_manager.get_sentinel2_data_for_parcel(parcel_geometry)
+            sentinel2_data = self.blob_manager.get_sentinel2_data_for_parcel_streaming(parcel_geometry)
             
             if not sentinel2_data:
                 logger.debug("No Sentinel-2 data available for parcel")
@@ -68,8 +68,8 @@ class VegetationAnalyzer:
             
             # Add metadata
             vegetation_indices.update({
-                'tile_id': sentinel2_data['tile_id'],
-                'acquisition_date': sentinel2_data['acquisition_date'],
+                'tile_id': sentinel2_data.get('tile_id', 'streaming'),
+                'acquisition_date': sentinel2_data.get('acquisition_date', datetime.now().isoformat()),
                 'pixel_count': int(np.sum(~np.isnan(vegetation_indices['ndvi']))),
                 'analysis_timestamp': datetime.now().isoformat()
             })
