@@ -14,14 +14,14 @@ import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
 
-from ..config.database_config_v1 import (
+from ..config.database_config_v3 import (
     get_database_config, 
     get_database_queries,
     CDL_CODES,
     URBAN_CODES,
     WORLDCOVER_CLASSES
 )
-from ..config.processing_config_v1 import get_processing_config
+from ..config.processing_config_v3 import get_processing_config
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +768,12 @@ class DatabaseManager:
                 conn.commit()
                 
                 logger.info(f"Successfully saved {len(parcel_results)} biomass analysis results to database")
+                
+                # Also save V3 enhanced results to separate tables
+                success_v3 = self.save_v3_enhanced_results(parcel_results)
+                if not success_v3:
+                    logger.warning("V3 enhanced results save failed, but V1 results saved successfully")
+                
                 return True
                 
         except Exception as e:
@@ -775,6 +781,201 @@ class DatabaseManager:
             import traceback
             traceback.print_exc()
             return False
+    
+    def save_v3_enhanced_results(self, parcel_results: List[Dict]) -> bool:
+        """
+        Save enhanced V3 results to forestry and crop analysis tables
+        Extracts detailed data from analyzer outputs for relational storage
+        
+        Args:
+            parcel_results: List of comprehensive parcel analysis results
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not parcel_results:
+            logger.warning("No V3 results to save")
+            return True
+        
+        try:
+            # Connect to V3 output database
+            with self.get_connection('biomass_output') as conn:
+                cursor = conn.cursor()
+                
+                # Prepare forestry and crop data for batch insert
+                forestry_records = []
+                crop_records = []
+                
+                for result in parcel_results:
+                    parcel_id = result['parcel_id']
+                    county_fips = result['county_fips']
+                    processing_timestamp = result.get('processing_timestamp')
+                    vegetation_indices = result.get('vegetation_indices', {})
+                    
+                    # Process forest analysis data
+                    forest_analysis = result.get('forest_analysis')
+                    logger.info(f"🌲 Parcel {parcel_id} forest_analysis type: {type(forest_analysis)}, value: {forest_analysis is not None}")
+                    if forest_analysis and isinstance(forest_analysis, list):
+                        logger.info(f"🌲 Parcel {parcel_id} has {len(forest_analysis)} forest records")
+                        for forest_record in forest_analysis:
+                            if forest_record and forest_record.get('biomass_type') == 'forest':
+                                logger.info(f"✅ Processing forest record for {parcel_id}: {forest_record.get('area_acres')} acres, biomass_type={forest_record.get('biomass_type')}")
+                                forestry_record = self._extract_forestry_record(
+                                    parcel_id, county_fips, processing_timestamp, 
+                                    forest_record, vegetation_indices
+                                )
+                                if forestry_record:
+                                    forestry_records.append(forestry_record)
+                                    logger.info(f"✅ Added forest record to save list for {parcel_id}")
+                            else:
+                                logger.warning(f"❌ Forest record missing biomass_type='forest': {forest_record}")
+                    elif forest_analysis:
+                        logger.warning(f"❌ Parcel {parcel_id} forest_analysis is not a list: {type(forest_analysis)}")
+                    
+                    # Process crop analysis data  
+                    crop_analysis = result.get('crop_analysis')
+                    logger.info(f"🌾 Parcel {parcel_id} crop_analysis type: {type(crop_analysis)}, value: {crop_analysis is not None}")
+                    if crop_analysis and isinstance(crop_analysis, list):
+                        logger.info(f"🌾 Parcel {parcel_id} has {len(crop_analysis)} crop records")
+                        dominant_crop = None
+                        max_area = 0
+                        
+                        # Find dominant crop
+                        for crop_record in crop_analysis:
+                            if crop_record and crop_record.get('biomass_type') == 'crop':
+                                area = crop_record.get('area_acres', 0)
+                                if area > max_area:
+                                    max_area = area
+                                    dominant_crop = crop_record
+                            else:
+                                logger.warning(f"❌ Crop record missing biomass_type='crop': {crop_record}")
+                        
+                        # Process all crop records
+                        for crop_record in crop_analysis:
+                            if crop_record and crop_record.get('biomass_type') == 'crop':
+                                logger.info(f"✅ Processing crop record for {parcel_id}: {crop_record.get('source_name')}, {crop_record.get('area_acres')} acres, biomass_type={crop_record.get('biomass_type')}")
+                                is_dominant = (crop_record == dominant_crop)
+                                crop_v3_record = self._extract_crop_record(
+                                    parcel_id, county_fips, processing_timestamp,
+                                    crop_record, vegetation_indices, is_dominant
+                                )
+                                if crop_v3_record:
+                                    crop_records.append(crop_v3_record)
+                                    logger.info(f"✅ Added crop record to save list for {parcel_id}: {crop_record.get('source_name')}")
+                    elif crop_analysis:
+                        logger.warning(f"❌ Parcel {parcel_id} crop_analysis is not a list: {type(crop_analysis)}")
+                
+                # Bulk insert forestry records
+                if forestry_records:
+                    self._bulk_insert_forestry_records(cursor, forestry_records)
+                    logger.debug(f"Saved {len(forestry_records)} forestry records")
+                
+                # Bulk insert crop records
+                if crop_records:
+                    self._bulk_insert_crop_records(cursor, crop_records)
+                    logger.debug(f"Saved {len(crop_records)} crop records")
+                
+                conn.commit()
+                logger.info(f"Successfully saved V3 enhanced results: {len(forestry_records)} forestry, {len(crop_records)} crop records")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to save V3 enhanced results: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _extract_forestry_record(self, parcel_id: str, county_fips: str, 
+                               processing_timestamp, forest_record: Dict, 
+                               vegetation_indices: Dict) -> Optional[Tuple]:
+        """Extract forestry record data for database insert"""
+        try:
+            return (
+                parcel_id,
+                county_fips,
+                processing_timestamp,
+                forest_record.get('total_standing_biomass_tons'),
+                forest_record.get('area_acres'),
+                forest_record.get('coverage_percent'),
+                forest_record.get('stand_age_avg'),
+                forest_record.get('forest_type_dominant'),
+                forest_record.get('harvest_probability'),
+                forest_record.get('last_treatment_years'),
+                forest_record.get('tree_count_estimate'),
+                forest_record.get('average_dbh_inches'),
+                forest_record.get('average_height_feet'),
+                forest_record.get('total_standing_biomass_tons'),
+                forest_record.get('total_harvestable_biomass_tons'),
+                forest_record.get('forest_residue_biomass_tons'),
+                forest_record.get('fia_plot_count'),
+                forest_record.get('fia_tree_count'),
+                forest_record.get('data_sources'),
+                vegetation_indices.get('ndvi'),
+                forest_record.get('confidence_score')
+            )
+        except Exception as e:
+            logger.warning(f"Failed to extract forestry record: {e}")
+            return None
+    
+    def _extract_crop_record(self, parcel_id: str, county_fips: str,
+                           processing_timestamp, crop_record: Dict,
+                           vegetation_indices: Dict, is_dominant: bool) -> Optional[Tuple]:
+        """Extract crop record data for database insert"""
+        try:
+            return (
+                parcel_id,
+                county_fips,
+                processing_timestamp,
+                crop_record.get('source_code'),
+                crop_record.get('source_name'),
+                is_dominant,
+                crop_record.get('crop_category'),
+                crop_record.get('area_acres'),
+                crop_record.get('coverage_percent'),
+                crop_record.get('coverage_percent'),  # area_percentage
+                crop_record.get('yield_tons'),
+                crop_record.get('yield_tons_per_acre'),
+                crop_record.get('residue_tons_dry'),
+                crop_record.get('residue_tons_wet'),
+                crop_record.get('harvestable_residue_tons'),
+                crop_record.get('residue_ratio'),
+                crop_record.get('moisture_content'),
+                crop_record.get('harvestable_residue_percent'),
+                vegetation_indices.get('ndvi'),
+                crop_record.get('confidence_score')
+            )
+        except Exception as e:
+            logger.warning(f"Failed to extract crop record: {e}")
+            return None
+    
+    def _bulk_insert_forestry_records(self, cursor, forestry_records: List[Tuple]):
+        """Bulk insert forestry records"""
+        insert_sql = """
+        INSERT INTO forestry_analysis_v3 (
+            parcel_id, county_fips, processing_timestamp,
+            total_biomass_tons, forest_area_acres, forest_percentage,
+            stand_age_average, forest_type_classification, harvest_probability,
+            last_treatment_years, tree_count_estimate, average_dbh_inches,
+            average_height_feet, standing_biomass_tons, harvestable_biomass_tons,
+            residue_biomass_tons, fia_plot_count, fia_tree_count, data_sources,
+            ndvi_value, confidence_score
+        ) VALUES %s
+        """
+        psycopg2.extras.execute_values(cursor, insert_sql, forestry_records, page_size=1000)
+    
+    def _bulk_insert_crop_records(self, cursor, crop_records: List[Tuple]):
+        """Bulk insert crop records"""  
+        insert_sql = """
+        INSERT INTO crop_analysis_v3 (
+            parcel_id, county_fips, processing_timestamp,
+            crop_code, crop_name, is_dominant_crop, crop_category,
+            area_acres, coverage_percent, area_percentage, yield_tons,
+            yield_tons_per_acre, residue_tons_dry, residue_tons_wet,
+            harvestable_residue_tons, residue_ratio, moisture_content,
+            harvestable_residue_percent, ndvi_value, confidence_score
+        ) VALUES %s
+        """
+        psycopg2.extras.execute_values(cursor, insert_sql, crop_records, page_size=1000)
     
     def close_all_pools(self):
         """Close all connection pools"""
