@@ -227,14 +227,24 @@ class BlobManager:
             
             if len(bands_data) == 4:  # All bands downloaded successfully
                 cache_key = f"{tile_id}_{period}_{tile_date}"
+                
+                # Handle missing utm_bounds gracefully (coordinate transformer issue)
+                utm_bounds = tile_info.get('utm_bounds')
+                if utm_bounds is None:
+                    # Calculate utm_bounds from wgs84_bounds if missing
+                    wgs84_bounds = tile_info.get('wgs84_bounds')
+                    if wgs84_bounds:
+                        utm_bounds = wgs84_bounds  # Fallback to wgs84_bounds
+                        logger.debug(f"Using wgs84_bounds as fallback for utm_bounds for tile {tile_id}")
+                
                 self.sentinel2_cache[cache_key] = {
                     'tile_id': tile_id,
                     'period': period,
                     'date': tile_date,
                     'bands': bands_data,
-                    'utm_epsg': tile_info['utm_epsg'],
-                    'utm_bounds': tile_info['utm_bounds'],
-                    'wgs84_bounds': tile_info['wgs84_bounds']
+                    'utm_epsg': tile_info.get('utm_epsg', 4326),
+                    'utm_bounds': utm_bounds,
+                    'wgs84_bounds': tile_info.get('wgs84_bounds')
                 }
                 downloaded += 1
                 logger.info(f"Cached Sentinel-2 tile {tile_id}")

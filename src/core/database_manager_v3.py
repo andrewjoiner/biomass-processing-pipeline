@@ -814,28 +814,29 @@ class DatabaseManager:
                     
                     # Process forest analysis data
                     forest_analysis = result.get('forest_analysis')
-                    logger.debug(f"Parcel {parcel_id} forest_analysis type: {type(forest_analysis)}, value: {forest_analysis is not None}")
+                    logger.info(f"🌲 Parcel {parcel_id} forest_analysis type: {type(forest_analysis)}, value: {forest_analysis is not None}")
                     if forest_analysis and isinstance(forest_analysis, list):
-                        logger.debug(f"Parcel {parcel_id} has {len(forest_analysis)} forest records")
+                        logger.info(f"🌲 Parcel {parcel_id} has {len(forest_analysis)} forest records")
                         for forest_record in forest_analysis:
                             if forest_record and forest_record.get('biomass_type') == 'forest':
-                                logger.debug(f"Processing forest record for {parcel_id}: {forest_record.get('area_acres')} acres")
+                                logger.info(f"✅ Processing forest record for {parcel_id}: {forest_record.get('area_acres')} acres, biomass_type={forest_record.get('biomass_type')}")
                                 forestry_record = self._extract_forestry_record(
                                     parcel_id, county_fips, processing_timestamp, 
                                     forest_record, vegetation_indices
                                 )
                                 if forestry_record:
                                     forestry_records.append(forestry_record)
+                                    logger.info(f"✅ Added forest record to save list for {parcel_id}")
                             else:
-                                logger.debug(f"Forest record missing biomass_type='forest': {forest_record}")
+                                logger.warning(f"❌ Forest record missing biomass_type='forest': {forest_record}")
                     elif forest_analysis:
-                        logger.warning(f"Parcel {parcel_id} forest_analysis is not a list: {type(forest_analysis)}")
+                        logger.warning(f"❌ Parcel {parcel_id} forest_analysis is not a list: {type(forest_analysis)}")
                     
                     # Process crop analysis data  
                     crop_analysis = result.get('crop_analysis')
-                    logger.debug(f"Parcel {parcel_id} crop_analysis type: {type(crop_analysis)}, value: {crop_analysis is not None}")
+                    logger.info(f"🌾 Parcel {parcel_id} crop_analysis type: {type(crop_analysis)}, value: {crop_analysis is not None}")
                     if crop_analysis and isinstance(crop_analysis, list):
-                        logger.debug(f"Parcel {parcel_id} has {len(crop_analysis)} crop records")
+                        logger.info(f"🌾 Parcel {parcel_id} has {len(crop_analysis)} crop records")
                         dominant_crop = None
                         max_area = 0
                         
@@ -847,12 +848,12 @@ class DatabaseManager:
                                     max_area = area
                                     dominant_crop = crop_record
                             else:
-                                logger.debug(f"Crop record missing biomass_type='crop': {crop_record}")
+                                logger.warning(f"❌ Crop record missing biomass_type='crop': {crop_record}")
                         
                         # Process all crop records
                         for crop_record in crop_analysis:
                             if crop_record and crop_record.get('biomass_type') == 'crop':
-                                logger.debug(f"Processing crop record for {parcel_id}: {crop_record.get('source_name')}, {crop_record.get('area_acres')} acres")
+                                logger.info(f"✅ Processing crop record for {parcel_id}: {crop_record.get('source_name')}, {crop_record.get('area_acres')} acres, biomass_type={crop_record.get('biomass_type')}")
                                 is_dominant = (crop_record == dominant_crop)
                                 crop_v3_record = self._extract_crop_record(
                                     parcel_id, county_fips, processing_timestamp,
@@ -860,8 +861,9 @@ class DatabaseManager:
                                 )
                                 if crop_v3_record:
                                     crop_records.append(crop_v3_record)
+                                    logger.info(f"✅ Added crop record to save list for {parcel_id}: {crop_record.get('source_name')}")
                     elif crop_analysis:
-                        logger.warning(f"Parcel {parcel_id} crop_analysis is not a list: {type(crop_analysis)}")
+                        logger.warning(f"❌ Parcel {parcel_id} crop_analysis is not a list: {type(crop_analysis)}")
                 
                 # Bulk insert forestry records
                 if forestry_records:

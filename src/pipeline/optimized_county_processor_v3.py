@@ -172,7 +172,7 @@ class OptimizedCountyProcessor:
             
             logger.info(f"📍 Loaded {len(geometries)} parcels")
             
-            # Step 2: Analyze spatial tile requirements (don't pre-load everything)
+            # Step 2: Download satellite data for county (like comprehensive processor)
             logger.info("🗺️ Analyzing spatial tile requirements...")
             county_bounds = self.db_manager.get_county_bounds(state_fips, county_fips)
             
@@ -183,7 +183,17 @@ class OptimizedCountyProcessor:
             logger.info(f"📊 Tile analysis: {len(required_tiles['sentinel2'])} Sentinel-2 tiles, "
                        f"{len(required_tiles['worldcover'])} WorldCover tiles required")
             
-            # Store requirements for on-demand loading during processing
+            # Download satellite tiles for county (CRITICAL FIX for Sentinel-2 data access)
+            logger.info("📡 Pre-downloading satellite tiles for county...")
+            try:
+                sentinel2_stats = self.blob_manager.download_sentinel2_county_tiles(county_bounds)
+                worldcover_stats = self.blob_manager.download_worldcover_county_tiles(county_bounds)
+                logger.info(f"✅ Downloaded {sentinel2_stats['sentinel2_tiles']} Sentinel-2 tiles, "
+                           f"{worldcover_stats['worldcover_tiles']} WorldCover tiles")
+            except Exception as e:
+                logger.warning(f"Satellite tile download failed: {e}")
+            
+            # Store requirements for reference
             self.county_data['required_tiles'] = required_tiles
             self.county_data['county_bounds'] = county_bounds
             
