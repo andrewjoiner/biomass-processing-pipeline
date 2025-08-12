@@ -57,8 +57,8 @@ class BlobManager:
         self.county_tile_index = {}  # {tile_id: {blob_paths, bounds, transform}}
         
         # Streaming tile cache with LRU eviction (Phase 2 fix) - OPTIMIZED
-        self.streaming_tile_cache = {}  # {tile_id_band: {data, metadata, last_used}}
-        self.max_streaming_cache_size = 500  # Increased from 50 to 500 tiles (~ 125GB max)
+        self.streaming_tile_cache = {}  # {tile_id: {bands: {B02: {data, metadata}, B03: {...}}, last_used}}
+        self.max_streaming_cache_size = 20  # 20 tiles with all bands (~5GB max, sufficient for county processing)
         self.cache_access_order = []  # Track access order for LRU eviction
         
         # Performance tracking
@@ -162,47 +162,138 @@ class BlobManager:
             logger.debug(f"Error checking preprocessed tile for {blob_path}: {e}")
             return None
     
-    def _get_from_streaming_cache(self, cache_key: str) -> Optional[Dict]:
-        """Get tile from streaming cache and update access order"""
-        if cache_key in self.streaming_tile_cache:
-            # Move to end of access order (most recently used)
-            if cache_key in self.cache_access_order:
-                self.cache_access_order.remove(cache_key)
-            self.cache_access_order.append(cache_key)
+    def _get_from_streaming_cache(self, tile_id: str, band: str) -> Optional[Dict]:
+        """Get specific band from tile cache and update access order"""
+        if tile_id in self.streaming_tile_cache:
+            tile_cache = self.streaming_tile_cache[tile_id]
             
-            # Update last used timestamp
-            import time
-            self.streaming_tile_cache[cache_key]['last_used'] = time.time()
-            
-            self.stats['streaming_cache_hits'] += 1
-            logger.debug(f"Cache HIT for {cache_key}")
-            return self.streaming_tile_cache[cache_key]
+            # Check if the specific band is cached
+            if 'bands' in tile_cache and band in tile_cache['bands']:
+                # Move to end of access order (most recently used)
+                if tile_id in self.cache_access_order:
+                    self.cache_access_order.remove(tile_id)
+                self.cache_access_order.append(tile_id)
+                
+                # Update last used timestamp
+                import time
+                tile_cache['last_used'] = time.time()
+                
+                self.stats['streaming_cache_hits'] += 1
+                logger.debug(f"Cache HIT for {tile_id}:{band}")
+                return tile_cache['bands'][band]
         
         self.stats['streaming_cache_misses'] += 1
-        logger.debug(f"Cache MISS for {cache_key}")
+        logger.debug(f"Cache MISS for {tile_id}:{band}")
         return None
     
-    def _add_to_streaming_cache(self, cache_key: str, data: Dict):
-        """Add tile to streaming cache with LRU eviction"""
+    def _add_to_streaming_cache(self, tile_id: str, band: str, band_data: Dict):
+        """Add band data to tile cache with LRU eviction"""
         import time
         
-        # Check if we need to evict old items
-        if len(self.streaming_tile_cache) >= self.max_streaming_cache_size:
-            # Remove least recently used items
+        # Check if we need to evict old tiles
+        if tile_id not in self.streaming_tile_cache and len(self.streaming_tile_cache) >= self.max_streaming_cache_size:
+            # Remove least recently used tiles
             while len(self.streaming_tile_cache) >= self.max_streaming_cache_size:
                 if self.cache_access_order:
-                    lru_key = self.cache_access_order.pop(0)
-                    if lru_key in self.streaming_tile_cache:
-                        del self.streaming_tile_cache[lru_key]
-                        logger.debug(f"Evicted {lru_key} from streaming cache")
+                    lru_tile_id = self.cache_access_order.pop(0)
+                    if lru_tile_id in self.streaming_tile_cache:
+                        del self.streaming_tile_cache[lru_tile_id]
+                        logger.debug(f"Evicted tile {lru_tile_id} from streaming cache")
                 else:
                     break
         
-        # Add new item
-        data['last_used'] = time.time()
-        self.streaming_tile_cache[cache_key] = data
-        self.cache_access_order.append(cache_key)
-        logger.debug(f"Added {cache_key} to streaming cache")
+        # Initialize tile entry if it doesn't exist
+        if tile_id not in self.streaming_tile_cache:
+            self.streaming_tile_cache[tile_id] = {
+                'bands': {},
+                'last_used': time.time()
+            }
+            self.cache_access_order.append(tile_id)
+        
+        # Add band data to tile
+        self.streaming_tile_cache[tile_id]['bands'][band] = band_data
+        self.streaming_tile_cache[tile_id]['last_used'] = time.time()
+        
+        # Update access order
+        if tile_id in self.cache_access_order:
+            self.cache_access_order.remove(tile_id)
+        self.cache_access_order.append(tile_id)
+        
+        logger.debug(f"Added {tile_id}:{band} to streaming cache")
+    
+    def _download_and_cache_tile_all_bands(self, tile_id: str, tile_info: Dict) -> bool:
+        """
+        Download all bands for a tile and cache them together
+        
+        Args:
+            tile_id: The tile identifier (e.g., "16TDM")
+            tile_info: Tile information with blob_paths for all bands
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.info(f"📦 Downloading all bands for tile {tile_id}")
+            
+            # Check if tile is already fully cached
+            if tile_id in self.streaming_tile_cache:
+                cached_bands = self.streaming_tile_cache[tile_id].get('bands', {})
+                missing_bands = [band for band in self.sentinel2_config['bands'] 
+                               if band not in cached_bands]
+                if not missing_bands:
+                    logger.debug(f"All bands already cached for tile {tile_id}")
+                    return True
+            else:
+                missing_bands = self.sentinel2_config['bands']
+            
+            # Download missing bands
+            for band in missing_bands:
+                blob_path = tile_info['blob_paths'][band]
+                
+                # Check for preprocessed tile first
+                preprocessed_path = self._check_preprocessed_tile_available(blob_path)
+                container = self.preprocessed_container if preprocessed_path else self.config['containers']['sentinel2']
+                download_path = preprocessed_path if preprocessed_path else blob_path
+                
+                # Download blob data
+                blob_data = self.download_blob_to_memory(container, download_path)
+                if not blob_data:
+                    logger.warning(f"Failed to download {band} for tile {tile_id}")
+                    continue
+                
+                # Process blob data into raster
+                try:
+                    from rasterio.io import MemoryFile
+                    with MemoryFile(blob_data) as memfile:
+                        with memfile.open() as dataset:
+                            tile_data = dataset.read(1)  # Read first band
+                            dataset_info = {
+                                'width': dataset.width,
+                                'height': dataset.height,
+                                'transform': dataset.transform,
+                                'crs': dataset.crs,
+                                'nodata': dataset.nodata
+                            }
+                    
+                    # Cache the band data
+                    band_data = {
+                        'tile_data': tile_data,
+                        'dataset_info': dataset_info,
+                        'source': 'preprocessed' if preprocessed_path else 'compressed'
+                    }
+                    
+                    self._add_to_streaming_cache(tile_id, band, band_data)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process {band} for tile {tile_id}: {e}")
+                    continue
+            
+            logger.info(f"✅ Successfully cached {len(self.streaming_tile_cache[tile_id]['bands'])} bands for tile {tile_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to download tile {tile_id}: {e}")
+            return False
     
     def download_blob_to_memory(self, container: str, blob_name: str) -> Optional[bytes]:
         """
@@ -659,158 +750,64 @@ class BlobManager:
             Dictionary with clipped raster data or None
         """
         try:
-            # Create cache key from blob path
-            cache_key = blob_path.replace('/', '_').replace('.', '_')
+            # Extract tile ID and band from blob path
+            tile_id = self._extract_tile_id_from_blob_path(blob_path)
+            if not tile_id:
+                logger.error(f"Could not extract tile ID from {blob_path}")
+                return None
+                
+            # Extract band from blob path (e.g., B02, B03, etc.)
+            band = None
+            for band_name in self.sentinel2_config['bands']:
+                if band_name in blob_path:
+                    band = band_name
+                    break
+            
+            if not band:
+                logger.error(f"Could not extract band from {blob_path}")
+                return None
             
             # Check streaming cache first 
-            cached_tile = self._get_from_streaming_cache(cache_key)
+            cached_band_data = self._get_from_streaming_cache(tile_id, band)
             
-            if cached_tile:
+            if cached_band_data:
                 # Use cached tile data
-                logger.debug(f"Using cached tile for {blob_path}")
-                dataset_info = cached_tile['dataset_info']
-                tile_data = cached_tile['tile_data']
+                logger.debug(f"Using cached data for {tile_id}:{band}")
+                dataset_info = cached_band_data['dataset_info']
+                tile_data = cached_band_data['tile_data']
                 used_streaming = False
             else:
-                # Step 0: Check for preprocessed uncompressed tile first
-                preprocessed_path = self._check_preprocessed_tile_available(blob_path)
-                
-                if preprocessed_path:
-                    logger.info(f"🎯 Using preprocessed uncompressed tile: {preprocessed_path}")
-                    
-                    # Download preprocessed tile (should enable streaming)
-                    blob_data = self.download_blob_to_memory(
-                        self.preprocessed_container, 
-                        preprocessed_path
-                    )
-                    
-                    if blob_data:
-                        self.stats['preprocessed_tiles_used'] += 1
-                        
-                        # Process preprocessed tile (should be uncompressed and streamable)
-                        with MemoryFile(blob_data) as memfile:
-                            with memfile.open() as dataset:
-                                tile_data = dataset.read(1)  # Read first band
-                                dataset_info = {
-                                    'width': dataset.width,
-                                    'height': dataset.height, 
-                                    'transform': dataset.transform,
-                                    'crs': dataset.crs,
-                                    'nodata': dataset.nodata
-                                }
-                        
-                        # Cache the preprocessed tile result
-                        cache_data = {
-                            'tile_data': tile_data,
-                            'dataset_info': dataset_info,
-                            'source': 'preprocessed'
-                        }
-                        self._add_to_streaming_cache(cache_key, cache_data)
-                        used_streaming = True  # Mark as streaming success
-                        
-                        logger.info(f"✅ Preprocessed tile loaded and cached: {preprocessed_path}")
-                    else:
-                        logger.warning(f"Failed to download preprocessed tile: {preprocessed_path}")
-                        preprocessed_path = None  # Fall back to original processing
-                
-                if not preprocessed_path:
-                    # Fallback: Attempt pixel streaming on compressed tile or full download
-                    self.stats['compressed_tiles_fallback'] += 1
-                    logger.debug(f"Attempting pixel streaming for compressed tile: {blob_path}")
-                    
-                    # Step 1: Download header to analyze GeoTIFF structure
-                    blob_client = self.blob_client.get_blob_client(
-                        container=self.config['containers']['sentinel2'],
-                        blob=blob_path
-                    )
-                
-                try:
-                    # Download first 8KB to get GeoTIFF header
-                    logger.debug(f"Downloading header for streaming analysis: {blob_path}")
-                    header_data = blob_client.download_blob(offset=0, length=8192).readall()
-                    header_info = self._parse_geotiff_header(header_data)
-                    
-                    if header_info:
-                        logger.debug(f"GeoTIFF header parsed - organization: {header_info.get('organization')}, "
-                                   f"streaming_supported: {header_info.get('streaming_supported')}")
-                                   
-                        if header_info.get('streaming_supported'):
-                            # Step 2: Calculate pixel window for parcel
-                            pixel_window = self._calculate_pixel_window(parcel_geometry, tile_info)
-                            
-                            if pixel_window:
-                                logger.debug(f"Pixel window calculated - size: {pixel_window.get('pixel_window', {}).get('width')}x{pixel_window.get('pixel_window', {}).get('height')}, "
-                                           f"supported: {pixel_window.get('window_supported')}")
-                                           
-                                if pixel_window.get('window_supported'):
-                                    # Step 3: Stream only the needed pixel window
-                                    pixel_data = self._stream_pixel_window_range_request(blob_path, pixel_window)
-                                    
-                                    if pixel_data and pixel_data.get('streaming_feasible'):
-                                        logger.info(f"🚀 Pixel streaming successful for {blob_path}: "
-                                                  f"{pixel_data.get('tiles_needed')} tiles, "
-                                                  f"~{pixel_data.get('estimated_bytes', 0)/1024:.1f}KB estimated")
-                                        # In a complete implementation, we would use the streamed data here
-                                        # For now, we fall through to demonstrate the streaming analysis worked
-                                    else:
-                                        logger.debug(f"Pixel streaming not feasible for {blob_path}")
-                                else:
-                                    logger.debug(f"Pixel window too large for streaming: {blob_path}")
-                            else:
-                                logger.debug(f"Could not calculate pixel window for {blob_path}")
-                        else:
-                            logger.debug(f"Streaming not supported for {blob_path}: {header_info.get('organization', 'unknown')} organization")
-                    else:
-                        logger.debug(f"Could not parse GeoTIFF header for {blob_path}")
-                        
-                except Exception as e:
-                    logger.debug(f"Pixel streaming failed for {blob_path}: {e}")
-                
-                # Fallback: Download full tile and cache it (Phase 2 approach)
-                logger.info(f"📦 Falling back to full tile download and caching for {blob_path}")
-                self.stats['streaming_cache_misses'] += 1
-                blob_data = self.download_blob_to_memory(
-                    self.config['containers']['sentinel2'], 
-                    blob_path
-                )
-                
-                if not blob_data:
-                    logger.debug(f"Could not download blob: {blob_path}")
+                # Download all bands for this tile if not cached
+                if not self._download_and_cache_tile_all_bands(tile_id, tile_info):
+                    logger.error(f"Failed to download tile {tile_id}")
                     return None
                 
-                # Read tile data and metadata for caching
-                with MemoryFile(blob_data) as memfile:
-                    with memfile.open() as dataset:
-                        tile_data = dataset.read(1)  # Read first band
-                        dataset_info = {
-                            'crs': dataset.crs,
-                            'transform': dataset.transform,
-                            'bounds': dataset.bounds,
-                            'shape': tile_data.shape,
-                            'dtype': tile_data.dtype,
-                            'nodata': dataset.nodata
-                        }
-                
-                # Cache the tile data for reuse
-                cache_data = {
-                    'tile_data': tile_data,
-                    'dataset_info': dataset_info,
-                    'blob_path': blob_path
-                }
-                self._add_to_streaming_cache(cache_key, cache_data)
-                used_streaming = False
+                # Get the specific band data from cache
+                cached_band_data = self._get_from_streaming_cache(tile_id, band)
+                if not cached_band_data:
+                    logger.error(f"Band {band} not found in cache after download")
+                    return None
+                    
+                dataset_info = cached_band_data['dataset_info']
+                tile_data = cached_band_data['tile_data']
+                used_streaming = cached_band_data.get('source') == 'preprocessed'
             
             # Now clip the tile data to parcel geometry
+            from rasterio.io import MemoryFile
+            from rasterio.mask import mask
+            from rasterio.warp import transform_geom
+            
             with MemoryFile() as memfile:
                 # Create temporary raster from tile data
                 with memfile.open(
                     driver='GTiff',
-                    height=dataset_info['shape'][0],
-                    width=dataset_info['shape'][1],
+                    height=dataset_info['height'],
+                    width=dataset_info['width'],
                     count=1,
-                    dtype=dataset_info['dtype'],
+                    dtype=tile_data.dtype,
                     crs=dataset_info['crs'],
-                    transform=dataset_info['transform']
+                    transform=dataset_info['transform'],
+                    nodata=dataset_info.get('nodata')
                 ) as temp_dataset:
                     temp_dataset.write(tile_data, 1)
                 
@@ -818,13 +815,11 @@ class BlobManager:
                 with memfile.open() as temp_dataset:
                     # Transform geometry to raster CRS if needed
                     if temp_dataset.crs != 'EPSG:4326':
-                        from rasterio.warp import transform_geom
                         transformed_geom = transform_geom('EPSG:4326', temp_dataset.crs, parcel_geometry)
                     else:
                         transformed_geom = parcel_geometry
                     
                     # Clip raster to geometry
-                    from rasterio.mask import mask
                     clipped_data, clipped_transform = mask(
                         temp_dataset, [transformed_geom], crop=True, nodata=temp_dataset.nodata
                     )
@@ -836,9 +831,11 @@ class BlobManager:
                             'crs': temp_dataset.crs,
                             'nodata': temp_dataset.nodata,
                             'source_blob': blob_path,
-                            'cached': cached_tile is not None,
+                            'cached': True,  # Always cached now with new approach
                             'streaming_attempted': True,
-                            'streaming_used': used_streaming
+                            'streaming_used': used_streaming,
+                            'tile_id': tile_id,
+                            'band': band
                         }
             
             return None
@@ -1177,6 +1174,31 @@ class BlobManager:
         except Exception as e:
             logger.error(f"Error calculating required tiles: {e}")
             return {'sentinel2': [], 'worldcover': []}
+    
+    def _extract_tile_id_from_blob_path(self, blob_path: str) -> Optional[str]:
+        """
+        Extract tile ID from blob path for cache key
+        
+        Example: sentinel2_august/16TDM_20240831_B02.tif -> 16TDM
+        
+        Args:
+            blob_path: Full blob path 
+            
+        Returns:
+            Tile ID string or None if extraction fails
+        """
+        try:
+            # Extract filename from path
+            filename = blob_path.split('/')[-1]
+            # Extract tile ID (before first underscore)
+            # Format: {tile_id}_{date}_{band}.tif
+            parts = filename.split('_')
+            if len(parts) >= 3:
+                return parts[0]  # tile_id like "16TDM"
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to extract tile ID from {blob_path}: {e}")
+            return None
     
     def clear_cache(self):
         """Clear all cached tile data"""
