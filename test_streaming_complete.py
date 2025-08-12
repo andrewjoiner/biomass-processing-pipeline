@@ -90,36 +90,38 @@ def test_streaming_complete():
         # Process 5 parcels using the streaming architecture
         processor = OptimizedCountyProcessor()
         
-        # Clear any existing test data first
-        with database_manager.get_connection('biomass_output') as conn:
+        # Get sample parcel IDs first
+        with database_manager.get_connection('parcels') as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                DELETE FROM vegetation_analysis_v3 
-                WHERE parcel_id IN (
-                    SELECT parcel_id FROM parcels 
-                    WHERE fipsstate = %s AND fipscounty = %s
-                    LIMIT 5
-                )
+                SELECT parcelid FROM parcels 
+                WHERE fipsstate = %s AND fipscounty = %s
+                AND geometry IS NOT NULL
+                LIMIT 5
             """, (state_fips, county_fips))
-            
-            cursor.execute("""
-                DELETE FROM forestry_analysis_v3 
-                WHERE parcel_id IN (
-                    SELECT parcel_id FROM parcels 
-                    WHERE fipsstate = %s AND fipscounty = %s
-                    LIMIT 5
-                )
-            """, (state_fips, county_fips))
-            
-            cursor.execute("""
-                DELETE FROM crop_analysis_v3 
-                WHERE parcel_id IN (
-                    SELECT parcel_id FROM parcels 
-                    WHERE fipsstate = %s AND fipscounty = %s
-                    LIMIT 5
-                )
-            """, (state_fips, county_fips))
-            conn.commit()
+            test_parcels = [row['parcelid'] for row in cursor.fetchall()]
+        
+        logger.info(f"🎯 Selected {len(test_parcels)} test parcels: {test_parcels[:2]}...")
+        
+        # Clear any existing test data first
+        if test_parcels:
+            with database_manager.get_connection('biomass_output') as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    DELETE FROM vegetation_analysis_v3 
+                    WHERE parcel_id = ANY(%s)
+                """, (test_parcels,))
+                
+                cursor.execute("""
+                    DELETE FROM forestry_analysis_v3 
+                    WHERE parcel_id = ANY(%s)
+                """, (test_parcels,))
+                
+                cursor.execute("""
+                    DELETE FROM crop_analysis_v3 
+                    WHERE parcel_id = ANY(%s)
+                """, (test_parcels,))
+                conn.commit()
         
         logger.info("🧹 Cleared any existing test data")
         
