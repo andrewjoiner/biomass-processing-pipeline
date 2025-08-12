@@ -41,41 +41,67 @@ class DatabaseManager:
         self._initialize_connection_pools()
         
     def _initialize_connection_pools(self):
-        """Initialize threaded connection pools for each database with minimal sizes for stability"""
-        pool_config = {
-            'minconn': 1,
-            'maxconn': 3,  # Drastically reduced to prevent database overload
-            'cursor_factory': psycopg2.extras.RealDictCursor,
-            'connect_timeout': 60  # Increased timeout for recovery
-        }
+        """Initialize threaded connection pools for each database with optimized sizes per database"""
         
         for db_name, db_config in self.config.items():
             try:
-                logger.info(f"Initializing connection pool for {db_name} database...")
+                # Different pool sizes based on database usage patterns
+                if db_name == 'forestry':
+                    # Forestry database gets most connections due to heavy FIA queries
+                    pool_config = {
+                        'minconn': 2,
+                        'maxconn': 20,  # Increased for forestry DB performance
+                        'cursor_factory': psycopg2.extras.RealDictCursor,
+                        'connect_timeout': 30
+                    }
+                    logger.info(f"Using high-capacity pool for {db_name} database (20 connections)")
+                elif db_name == 'biomass_output':
+                    # Output database gets moderate connections for batch inserts
+                    pool_config = {
+                        'minconn': 1,
+                        'maxconn': 8,
+                        'cursor_factory': psycopg2.extras.RealDictCursor,
+                        'connect_timeout': 30
+                    }
+                    logger.info(f"Using medium-capacity pool for {db_name} database (8 connections)")
+                else:
+                    # Parcels and crops databases use standard pool
+                    pool_config = {
+                        'minconn': 1,
+                        'maxconn': 5,
+                        'cursor_factory': psycopg2.extras.RealDictCursor,
+                        'connect_timeout': 30
+                    }
+                    logger.info(f"Using standard pool for {db_name} database (5 connections)")
+                
                 self.pools[db_name] = ThreadedConnectionPool(
                     **pool_config,
                     **db_config
                 )
-                logger.info(f"Database {db_name} connection: OK")
+                logger.info(f"Database {db_name} connection pool: OK")
             except Exception as e:
                 logger.error(f"Failed to initialize {db_name} database pool: {e}")
                 raise
     
     @contextmanager
-    def get_connection(self, database: str, timeout: int = 60, retries: int = 3):
+    def get_connection(self, database: str, timeout: int = 60, retries: int = None):
         """
         Context manager for database connections with automatic cleanup, retry logic, and timeout
         
         Args:
             database: Database name ('parcels', 'crops', 'forestry', 'biomass_output')
             timeout: Connection timeout in seconds
-            retries: Number of retry attempts for transient failures
+            retries: Number of retry attempts (None for auto-selection based on database)
             
         Yields:
             Database connection
         """
         conn = None
         last_exception = None
+        
+        # Auto-select retry count based on database reliability needs
+        if retries is None:
+            retries = 5 if database == 'forestry' else 3  # More retries for problematic forestry DB
         
         for attempt in range(retries + 1):
             try:

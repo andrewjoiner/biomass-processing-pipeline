@@ -8,7 +8,9 @@ import gc
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -60,15 +62,17 @@ class OptimizedCountyProcessor:
     
     def process_county_optimized(self, state_fips: str, county_fips: str, 
                                 max_parcels: Optional[int] = None,
-                                batch_size: int = 1000) -> Dict:
+                                batch_size: int = 100,  # Reduced from 1000 to optimize memory usage
+                                max_workers: int = 4) -> Dict:
         """
-        Process entire county with optimized batch operations
+        Process entire county with optimized batch operations and parallel processing
         
         Args:
             state_fips: State FIPS code
             county_fips: County FIPS code  
             max_parcels: Optional limit on parcels to process
-            batch_size: Number of parcels to process per batch
+            batch_size: Number of parcels to process per batch (default: 100, optimized for memory)
+            max_workers: Maximum concurrent parcel processing threads (default: 4)
             
         Returns:
             Processing results dictionary
@@ -92,9 +96,9 @@ class OptimizedCountyProcessor:
             
             logger.info(f"✅ County setup completed in {setup_time:.1f}s")
             
-            # Phase 2: Batch process parcels
+            # Phase 2: Batch process parcels with parallel processing
             processing_start = time.time()
-            parcel_results = self._process_parcels_in_batches(batch_size)
+            parcel_results = self._process_parcels_in_batches(batch_size, max_workers)
             processing_time = time.time() - processing_start
             self.processing_stats['parcel_processing_time'] = processing_time
             
@@ -321,9 +325,13 @@ class OptimizedCountyProcessor:
         except Exception as e:
             logger.error(f"Error building spatial indices: {e}")
     
-    def _process_parcels_in_batches(self, batch_size: int) -> List[Dict]:
+    def _process_parcels_in_batches(self, batch_size: int, max_workers: int = 4) -> List[Dict]:
         """
-        Process parcels in optimized batches using pre-loaded data
+        Process parcels in optimized batches using pre-loaded data with parallel processing
+        
+        Args:
+            batch_size: Number of parcels per batch
+            max_workers: Maximum concurrent threads for parcel processing
         """
         parcel_gdf = self.county_data['parcel_gdf']
         total_parcels = len(parcel_gdf)
@@ -338,8 +346,8 @@ class OptimizedCountyProcessor:
             
             logger.info(f"📦 Processing batch {i//batch_size + 1}: parcels {i+1}-{batch_end}")
             
-            # Process this batch
-            batch_results = self._process_parcel_batch(batch_gdf)
+            # Process this batch with parallel processing
+            batch_results = self._process_parcel_batch(batch_gdf, max_workers)
             
             # Save batch results to database immediately after processing
             if batch_results:
@@ -368,73 +376,106 @@ class OptimizedCountyProcessor:
         self.processing_stats['parcels_processed'] = len(all_results)
         return all_results
     
-    def _process_parcel_batch(self, batch_gdf: gpd.GeoDataFrame) -> List[Dict]:
+    def _process_parcel_batch(self, batch_gdf: gpd.GeoDataFrame, max_workers: int = 4) -> List[Dict]:
         """
-        Process a batch of parcels using individual comprehensive parcel analysis
-        Uses the working V3 analyzers instead of placeholder batch logic
+        Process a batch of parcels using parallel comprehensive parcel analysis
+        Uses concurrent processing with the working V3 analyzers
+        
+        Args:
+            batch_gdf: GeoDataFrame containing parcels to process
+            max_workers: Maximum number of concurrent worker threads
         """
+        logger.debug(f"🔍 Processing batch of {len(batch_gdf)} parcels with {max_workers} concurrent workers")
+        
+        # Extract state/county FIPS from the first parcel
+        first_row = batch_gdf.iloc[0]
+        state_fips = first_row.get('state_fips', '17')  # Default to Illinois if not found
+        county_fips = first_row.get('county_fips', '113')  # Default to McLean if not found
+        
+        # Create a partial function with fixed state/county FIPS
+        process_single_parcel = partial(self._process_single_parcel_from_row, state_fips, county_fips)
+        
         batch_results = []
         
-        logger.debug(f"🔍 Processing batch of {len(batch_gdf)} parcels with V3 comprehensive analysis")
-        
         try:
-            # Extract state/county FIPS from the first parcel for comprehensive processor
-            first_row = batch_gdf.iloc[0]
-            state_fips = first_row.get('state_fips', '17')  # Default to Illinois if not found
-            county_fips = first_row.get('county_fips', '113')  # Default to McLean if not found
-            
-            # Process each parcel individually using comprehensive processor
-            for idx, row in batch_gdf.iterrows():
-                parcel_id = row['parcel_id']
+            # Process parcels in parallel
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all parcels to the thread pool
+                future_to_parcel = {}
+                for idx, row in batch_gdf.iterrows():
+                    future = executor.submit(process_single_parcel, row)
+                    future_to_parcel[future] = row['parcel_id']
                 
-                logger.debug(f"🌿 Processing parcel {parcel_id} with V3 comprehensive analyzers")
-                
-                # Create parcel dictionary in format expected by comprehensive processor
-                parcel = {
-                    'parcelid': parcel_id,
-                    'geometry': None,  # Will be filled from GeoDataFrame geometry
-                    'postgis_geometry': row.get('postgis_geometry', ''),
-                    'acres': row['acres'],
-                    'centroid_lon': row['centroid_lon'],
-                    'centroid_lat': row['centroid_lat']
-                }
-                
-                # Extract geometry from GeoDataFrame
-                try:
-                    geom = row.geometry
-                    if geom:
-                        # Convert to GeoJSON format expected by analyzers
-                        parcel['geometry'] = geom.__geo_interface__
-                    else:
-                        logger.warning(f"No geometry found for parcel {parcel_id}")
+                # Collect results as they complete
+                successful_results = 0
+                for future in as_completed(future_to_parcel):
+                    parcel_id = future_to_parcel[future]
+                    try:
+                        parcel_result = future.result(timeout=300)  # 5 minute timeout per parcel
+                        if parcel_result:
+                            batch_results.append(parcel_result)
+                            successful_results += 1
+                            logger.debug(f"✅ Parallel analysis successful for parcel {parcel_id}")
+                        else:
+                            logger.debug(f"⚠️ Parallel analysis returned no result for parcel {parcel_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Parallel analysis failed for parcel {parcel_id}: {e}")
                         continue
-                except Exception as e:
-                    logger.warning(f"Failed to extract geometry for parcel {parcel_id}: {e}")
-                    continue
-                
-                # Process parcel with comprehensive V3 analysis
-                try:
-                    parcel_result = self.comprehensive_processor.process_single_parcel_comprehensive(
-                        parcel, state_fips, county_fips
-                    )
-                    
-                    if parcel_result:
-                        logger.debug(f"✅ V3 analysis successful for parcel {parcel_id}")
-                        batch_results.append(parcel_result)
-                    else:
-                        logger.debug(f"⚠️ V3 analysis returned no result for parcel {parcel_id}")
                         
-                except Exception as e:
-                    logger.error(f"❌ V3 analysis failed for parcel {parcel_id}: {e}")
-                    continue
-                    
         except Exception as e:
-            logger.error(f"Error in V3 batch processing: {e}")
+            logger.error(f"Error in parallel batch processing: {e}")
             import traceback
             traceback.print_exc()
             
-        logger.info(f"🎯 V3 Batch processing complete: {len(batch_results)} successful results from {len(batch_gdf)} parcels")
+        logger.info(f"🎯 Parallel batch processing complete: {len(batch_results)} successful results from {len(batch_gdf)} parcels ({max_workers} workers)")
         return batch_results
+
+    def _process_single_parcel_from_row(self, state_fips: str, county_fips: str, row) -> Optional[Dict]:
+        """
+        Process a single parcel from a GeoDataFrame row (helper for parallel processing)
+        
+        Args:
+            state_fips: State FIPS code
+            county_fips: County FIPS code  
+            row: Single row from GeoDataFrame containing parcel data
+            
+        Returns:
+            Parcel analysis result or None if failed
+        """
+        parcel_id = row['parcel_id']
+        
+        # Create parcel dictionary in format expected by comprehensive processor
+        parcel = {
+            'parcelid': parcel_id,
+            'geometry': None,  # Will be filled from GeoDataFrame geometry
+            'postgis_geometry': row.get('postgis_geometry', ''),
+            'acres': row['acres'],
+            'centroid_lon': row['centroid_lon'],
+            'centroid_lat': row['centroid_lat']
+        }
+        
+        # Extract geometry from GeoDataFrame
+        try:
+            geom = row.geometry
+            if geom:
+                # Convert to GeoJSON format expected by analyzers
+                parcel['geometry'] = geom.__geo_interface__
+            else:
+                logger.warning(f"No geometry found for parcel {parcel_id}")
+                return None
+        except Exception as e:
+            logger.warning(f"Failed to extract geometry for parcel {parcel_id}: {e}")
+            return None
+        
+        # Process parcel with comprehensive V3 analysis
+        try:
+            parcel_result = self.comprehensive_processor.process_single_parcel_comprehensive(
+                parcel, state_fips, county_fips
+            )
+            return parcel_result
+        except Exception as e:
+            logger.error(f"❌ V3 analysis failed for parcel {parcel_id}: {e}")
+            return None
     
     def _save_batch_results_to_database(self, batch_results: List[Dict], batch_number: int) -> bool:
         """

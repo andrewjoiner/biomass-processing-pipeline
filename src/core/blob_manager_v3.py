@@ -21,6 +21,8 @@ from rasterio.warp import transform_bounds
 from shapely.geometry import shape
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError
+from azure.core.pipeline.policies import RetryPolicy
+from azure.core.configuration import Configuration
 
 from ..config.azure_config_v3 import (
     get_azure_config,
@@ -54,9 +56,9 @@ class BlobManager:
         # County tile index for streaming (metadata only, no tile data)
         self.county_tile_index = {}  # {tile_id: {blob_paths, bounds, transform}}
         
-        # Streaming tile cache with LRU eviction (Phase 2 fix)
+        # Streaming tile cache with LRU eviction (Phase 2 fix) - OPTIMIZED
         self.streaming_tile_cache = {}  # {tile_id_band: {data, metadata, last_used}}
-        self.max_streaming_cache_size = 50  # Maximum tiles to keep in cache
+        self.max_streaming_cache_size = 500  # Increased from 50 to 500 tiles (~ 125GB max)
         self.cache_access_order = []  # Track access order for LRU eviction
         
         # Performance tracking
@@ -66,20 +68,42 @@ class BlobManager:
             'streaming_cache_hits': 0,
             'streaming_cache_misses': 0,
             'total_bytes': 0,
-            'total_time': 0.0
+            'total_time': 0.0,
+            'preprocessed_tiles_used': 0,
+            'compressed_tiles_fallback': 0
         }
+        
+        # Preprocessing support - simple interface for now
+        self.preprocessing_enabled = True  # Enable checking for preprocessed tiles
+        self.preprocessed_container = 'preprocessed-tiles'  # Container for uncompressed tiles
     
     def _initialize_blob_client(self):
-        """Initialize Azure blob service client with authentication"""
+        """Initialize Azure blob service client with authentication and HTTP optimization"""
         try:
             # Try account key first
             if self.config['account_key']:
                 logger.info(f"Attempting account key authentication for {self.config['account_url']}")
+                
+                # Create optimized configuration for high-performance downloads
+                config = Configuration()
+                config.retry_policy = RetryPolicy(
+                    retry_total=3,
+                    retry_backoff_factor=1.0,
+                    retry_on_status_codes=[503, 500, 429]  # Service unavailable, server error, throttling
+                )
+                
                 self.blob_client = BlobServiceClient(
                     account_url=self.config['account_url'],
-                    credential=self.config['account_key']
+                    credential=self.config['account_key'],
+                    configuration=config,
+                    # HTTP/2 and connection optimization
+                    max_single_put_size=32*1024*1024,  # 32MB max single upload (not used but optimizes)
+                    max_block_size=4*1024*1024,  # 4MB chunks for large transfers
+                    connection_verify=True,
+                    connection_timeout=30,
+                    read_timeout=300  # 5 minute read timeout for large tiles
                 )
-                logger.info("✅ Using Azure storage account key authentication")
+                logger.info("✅ Using Azure storage account key authentication with HTTP optimization")
                 
                 # Test the connection
                 try:
@@ -98,6 +122,45 @@ class BlobManager:
         except Exception as e:
             logger.error(f"Failed to initialize Azure blob client: {e}")
             raise
+    
+    def _check_preprocessed_tile_available(self, blob_path: str) -> Optional[str]:
+        """
+        Check if an uncompressed preprocessed version of the tile exists
+        
+        Args:
+            blob_path: Original compressed tile path (e.g., "sentinel2_august/15TTE_20240831_B02.tif")
+            
+        Returns:
+            Preprocessed tile path if available, None otherwise
+        """
+        if not self.preprocessing_enabled:
+            return None
+            
+        try:
+            # Convert original path to preprocessed path
+            # Example: sentinel2_august/15TTE_20240831_B02.tif -> 15TTE_20240831_B02_uncompressed.tif
+            filename = blob_path.split('/')[-1]  # Get just the filename
+            base_name = filename.replace('.tif', '_uncompressed.tif')
+            preprocessed_path = base_name
+            
+            # Check if preprocessed tile exists
+            blob_client = self.blob_client.get_blob_client(
+                container=self.preprocessed_container,
+                blob=preprocessed_path
+            )
+            
+            # Quick existence check (just get properties)
+            blob_client.get_blob_properties()
+            
+            logger.debug(f"✅ Preprocessed tile found: {preprocessed_path}")
+            return preprocessed_path
+            
+        except ResourceNotFoundError:
+            logger.debug(f"❌ No preprocessed tile for: {blob_path}")
+            return None
+        except Exception as e:
+            logger.debug(f"Error checking preprocessed tile for {blob_path}: {e}")
+            return None
     
     def _get_from_streaming_cache(self, cache_key: str) -> Optional[Dict]:
         """Get tile from streaming cache and update access order"""
@@ -609,14 +672,57 @@ class BlobManager:
                 tile_data = cached_tile['tile_data']
                 used_streaming = False
             else:
-                # Attempt true pixel streaming first
-                logger.debug(f"Attempting pixel streaming for {blob_path}")
+                # Step 0: Check for preprocessed uncompressed tile first
+                preprocessed_path = self._check_preprocessed_tile_available(blob_path)
                 
-                # Step 1: Download header to analyze GeoTIFF structure
-                blob_client = self.blob_client.get_blob_client(
-                    container=self.config['containers']['sentinel2'],
-                    blob=blob_path
-                )
+                if preprocessed_path:
+                    logger.info(f"🎯 Using preprocessed uncompressed tile: {preprocessed_path}")
+                    
+                    # Download preprocessed tile (should enable streaming)
+                    blob_data = self.download_blob_to_memory(
+                        self.preprocessed_container, 
+                        preprocessed_path
+                    )
+                    
+                    if blob_data:
+                        self.stats['preprocessed_tiles_used'] += 1
+                        
+                        # Process preprocessed tile (should be uncompressed and streamable)
+                        with MemoryFile(blob_data) as memfile:
+                            with memfile.open() as dataset:
+                                tile_data = dataset.read(1)  # Read first band
+                                dataset_info = {
+                                    'width': dataset.width,
+                                    'height': dataset.height, 
+                                    'transform': dataset.transform,
+                                    'crs': dataset.crs,
+                                    'nodata': dataset.nodata
+                                }
+                        
+                        # Cache the preprocessed tile result
+                        cache_data = {
+                            'tile_data': tile_data,
+                            'dataset_info': dataset_info,
+                            'source': 'preprocessed'
+                        }
+                        self._add_to_streaming_cache(cache_key, cache_data)
+                        used_streaming = True  # Mark as streaming success
+                        
+                        logger.info(f"✅ Preprocessed tile loaded and cached: {preprocessed_path}")
+                    else:
+                        logger.warning(f"Failed to download preprocessed tile: {preprocessed_path}")
+                        preprocessed_path = None  # Fall back to original processing
+                
+                if not preprocessed_path:
+                    # Fallback: Attempt pixel streaming on compressed tile or full download
+                    self.stats['compressed_tiles_fallback'] += 1
+                    logger.debug(f"Attempting pixel streaming for compressed tile: {blob_path}")
+                    
+                    # Step 1: Download header to analyze GeoTIFF structure
+                    blob_client = self.blob_client.get_blob_client(
+                        container=self.config['containers']['sentinel2'],
+                        blob=blob_path
+                    )
                 
                 try:
                     # Download first 8KB to get GeoTIFF header
@@ -923,9 +1029,12 @@ class BlobManager:
         return None
     
     def get_cache_stats(self) -> Dict:
-        """Get cache and performance statistics"""
+        """Get cache and performance statistics including preprocessing metrics"""
         total_streaming_requests = self.stats['streaming_cache_hits'] + self.stats['streaming_cache_misses']
         streaming_cache_rate = (self.stats['streaming_cache_hits'] / total_streaming_requests * 100) if total_streaming_requests > 0 else 0
+        
+        total_tile_requests = self.stats['preprocessed_tiles_used'] + self.stats['compressed_tiles_fallback']
+        preprocessed_usage_rate = (self.stats['preprocessed_tiles_used'] / total_tile_requests * 100) if total_tile_requests > 0 else 0
         
         return {
             'sentinel2_tiles_cached': len(self.sentinel2_cache),
@@ -937,7 +1046,11 @@ class BlobManager:
             'total_downloads': self.stats['downloads'],
             'cache_hits': self.stats['cache_hits'],
             'total_bytes_downloaded': self.stats['total_bytes'],
-            'total_download_time': self.stats['total_time']
+            'total_download_time': self.stats['total_time'],
+            # Preprocessing statistics
+            'preprocessed_tiles_used': self.stats['preprocessed_tiles_used'],
+            'compressed_tiles_fallback': self.stats['compressed_tiles_fallback'],
+            'preprocessed_usage_rate': f"{preprocessed_usage_rate:.1f}%"
         }
     
     def _get_available_sentinel2_tiles(self) -> List[str]:
@@ -1170,7 +1283,7 @@ class BlobManager:
             if image_width and image_height:
                 if tile_width and tile_length and tile_offsets:
                     organization = 'tiled'
-                    # For tiled images, we could support streaming if uncompressed
+                    # For tiled images, support streaming if uncompressed OR if preprocessed version available
                     streaming_supported = (compression == 1)  # No compression
                 elif strip_offsets:
                     organization = 'stripped'
