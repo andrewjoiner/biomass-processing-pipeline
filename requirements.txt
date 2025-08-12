@@ -43,3 +43,6 @@ dask>=2023.5.0
 black>=23.3.0
 flake8>=6.0.0
 mypy>=1.3.0
+
+# MGRS tile calculations
+mgrs>=1.5.0

@@ -9,8 +9,9 @@ import math
 import re
 from typing import Dict, List, Optional, Tuple
 
+import mgrs
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Transformer, Geod
 from shapely.geometry import Point, Polygon, box
 from shapely.ops import transform
 
@@ -28,6 +29,10 @@ class CoordinateTransformer:
         
         # Common CRS definitions
         self.wgs84 = CRS.from_epsg(4326)
+        
+        # MGRS converter for tile bounds calculation
+        self.mgrs_converter = mgrs.MGRS()
+        self.geod = Geod(ellps='WGS84')
         
         # Sentinel-2 MGRS grid zones for efficient lookup
         self.mgrs_zones = self._initialize_mgrs_zones()
@@ -299,14 +304,18 @@ class CoordinateTransformer:
                     # Calculate actual tile bounds for intersection testing
                     actual_tile_bounds = self.get_sentinel2_tile_bounds(tile_id)
                     
-                    intersecting_tiles.append({
-                        'tile_id': tile_id,
-                        'utm_epsg': tile_info['utm_epsg'],
-                        'utm_zone': zone,
-                        'lat_band': band,
-                        'wgs84_bounds': actual_tile_bounds,  # Use actual tile bounds for proper intersection testing
-                        'county_bounds': wgs84_bounds       # Keep county bounds for reference
-                    })
+                    # Only include tiles that actually intersect the county bounds
+                    if actual_tile_bounds and self.bounds_intersect(wgs84_bounds, actual_tile_bounds):
+                        intersecting_tiles.append({
+                            'tile_id': tile_id,
+                            'utm_epsg': tile_info['utm_epsg'],
+                            'utm_zone': zone,
+                            'lat_band': band,
+                            'wgs84_bounds': actual_tile_bounds,  # Use actual tile bounds for proper intersection testing
+                            'county_bounds': wgs84_bounds       # Keep county bounds for reference
+                        })
+                    else:
+                        logger.debug(f"Tile {tile_id} in correct zone/band but doesn't intersect county bounds")
                     
             except Exception as e:
                 logger.warning(f"Could not process tile {tile_id}: {e}")
@@ -350,7 +359,7 @@ class CoordinateTransformer:
     
     def get_sentinel2_tile_bounds(self, tile_id: str) -> Optional[Tuple[float, float, float, float]]:
         """
-        Calculate WGS84 bounds for a Sentinel-2 MGRS tile
+        Calculate WGS84 bounds for a Sentinel-2 MGRS tile using the mgrs library
         Each Sentinel-2 tile is approximately 100km x 100km
         
         Args:
@@ -360,26 +369,19 @@ class CoordinateTransformer:
             WGS84 bounds (min_lon, min_lat, max_lon, max_lat) or None if failed
         """
         try:
-            # Parse tile ID to get UTM zone info
-            tile_info = self.parse_sentinel2_tile_id(tile_id)
-            utm_zone = tile_info['utm_zone']
-            lat_band = tile_info['lat_band']
-            grid_square = tile_info['grid_square']
-            utm_epsg = tile_info['utm_epsg']
+            # Use mgrs library to get the bottom-left corner of the tile
+            lat_min, lon_min = self.mgrs_converter.toLatLon(tile_id)
             
-            # Calculate approximate MGRS grid square bounds in UTM
-            # Each MGRS grid square is 100km x 100km
-            # Grid squares go A-Z, then AA-ZZ (excluding I and O)
+            # Calculate tile bounds using geodesic calculations
+            tile_size_meters = 100000  # 100km in meters
             
-            # Get base UTM coordinates for the grid square
-            utm_bounds = self._get_mgrs_grid_square_utm_bounds(utm_zone, lat_band, grid_square)
-            if utm_bounds is None:
-                return None
+            # Calculate degree equivalents at this location
+            # Move 100km east and north from the bottom-left corner
+            lon_max, lat_max, _ = self.geod.fwd(lon_min, lat_min, 90, tile_size_meters)  # 90° = due east
+            lon_temp, lat_max, _ = self.geod.fwd(lon_min, lat_min, 0, tile_size_meters)   # 0° = due north
             
-            # Convert UTM bounds to WGS84
-            wgs84_bounds = self.bounds_utm_to_wgs84(utm_bounds, utm_epsg)
-            
-            logger.debug(f"Tile {tile_id}: UTM bounds {utm_bounds} -> WGS84 bounds {wgs84_bounds}")
+            wgs84_bounds = (lon_min, lat_min, lon_max, lat_max)
+            logger.debug(f"Tile {tile_id}: WGS84 bounds {wgs84_bounds}")
             return wgs84_bounds
             
         except Exception as e:
