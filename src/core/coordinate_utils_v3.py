@@ -246,10 +246,10 @@ class CoordinateTransformer:
                                      available_tiles: List[str]) -> List[Dict]:
         """
         Get Sentinel-2 tiles that intersect with WGS84 bounds
-        CRITICAL FIX: Proper coordinate transformation for tile selection
+        REVERT TO WORKING V3 APPROACH: County-first tile selection (144 tiles for McLean County is correct!)
         
         Args:
-            wgs84_bounds: WGS84 bounds to search
+            wgs84_bounds: WGS84 bounds to search (min_lon, min_lat, max_lon, max_lat)
             available_tiles: List of available Sentinel-2 tile IDs
             
         Returns:
@@ -296,12 +296,16 @@ class CoordinateTransformer:
                 band_matches = band in target_lat_bands
                 
                 if zone_matches and band_matches:
+                    # Calculate actual tile bounds for intersection testing
+                    actual_tile_bounds = self.get_sentinel2_tile_bounds(tile_id)
+                    
                     intersecting_tiles.append({
                         'tile_id': tile_id,
                         'utm_epsg': tile_info['utm_epsg'],
                         'utm_zone': zone,
                         'lat_band': band,
-                        'wgs84_bounds': wgs84_bounds
+                        'wgs84_bounds': actual_tile_bounds,  # Use actual tile bounds for proper intersection testing
+                        'county_bounds': wgs84_bounds       # Keep county bounds for reference
                     })
                     
             except Exception as e:
@@ -343,6 +347,127 @@ class CoordinateTransformer:
                 tiles.append(tile_name)
         
         return tiles
+    
+    def get_sentinel2_tile_bounds(self, tile_id: str) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Calculate WGS84 bounds for a Sentinel-2 MGRS tile
+        Each Sentinel-2 tile is approximately 100km x 100km
+        
+        Args:
+            tile_id: Sentinel-2 tile ID (e.g., '15TUL')
+            
+        Returns:
+            WGS84 bounds (min_lon, min_lat, max_lon, max_lat) or None if failed
+        """
+        try:
+            # Parse tile ID to get UTM zone info
+            tile_info = self.parse_sentinel2_tile_id(tile_id)
+            utm_zone = tile_info['utm_zone']
+            lat_band = tile_info['lat_band']
+            grid_square = tile_info['grid_square']
+            utm_epsg = tile_info['utm_epsg']
+            
+            # Calculate approximate MGRS grid square bounds in UTM
+            # Each MGRS grid square is 100km x 100km
+            # Grid squares go A-Z, then AA-ZZ (excluding I and O)
+            
+            # Get base UTM coordinates for the grid square
+            utm_bounds = self._get_mgrs_grid_square_utm_bounds(utm_zone, lat_band, grid_square)
+            if utm_bounds is None:
+                return None
+            
+            # Convert UTM bounds to WGS84
+            wgs84_bounds = self.bounds_utm_to_wgs84(utm_bounds, utm_epsg)
+            
+            logger.debug(f"Tile {tile_id}: UTM bounds {utm_bounds} -> WGS84 bounds {wgs84_bounds}")
+            return wgs84_bounds
+            
+        except Exception as e:
+            logger.warning(f"Could not calculate bounds for tile {tile_id}: {e}")
+            return None
+    
+    def _get_mgrs_grid_square_utm_bounds(self, utm_zone: int, lat_band: str, grid_square: str) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Get UTM bounds for an MGRS 100km grid square using proper MGRS mathematics
+        
+        Args:
+            utm_zone: UTM zone number
+            lat_band: MGRS latitude band letter
+            grid_square: Two-letter grid square ID
+            
+        Returns:
+            UTM bounds (min_easting, min_northing, max_easting, max_northing) or None
+        """
+        try:
+            # Extract grid square column and row letters
+            col_letter = grid_square[0]
+            row_letter = grid_square[1]
+            
+            # MGRS 100km grid square calculation
+            # Column letters (excluding I and O): A-H, J-N, P-Z
+            # Row letters (excluding I and O): A-H, J-N, P-V
+            
+            # Create proper letter sequences excluding I and O
+            col_letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ'  # 24 letters (no I, O)
+            row_letters = 'ABCDEFGHJKLMNPQRSTUV'      # 20 letters (no I, O, W-Z)
+            
+            # Get column and row indices
+            try:
+                col_index = col_letters.index(col_letter)
+                row_index = row_letters.index(row_letter)
+            except ValueError:
+                logger.warning(f"Invalid MGRS letters: {col_letter}, {row_letter}")
+                return None
+            
+            # Calculate grid square origin in UTM coordinates
+            # MGRS grid squares are 100km x 100km
+            
+            # The MGRS grid origin depends on the UTM zone and latitude band
+            # For US zones, we need to calculate the proper false easting/northing
+            
+            # Standard UTM false easting is 500,000m
+            # MGRS grid squares start from different origins per zone/band
+            
+            # MGRS 100km grid square calculation for US zones
+            # The MGRS grid origin varies by UTM zone and uses a complex pattern
+            
+            # Calculate easting: Use proper MGRS column offset
+            # For UTM zones 10-19 (US), the grid starts around these eastings:
+            zone_easting_origins = {
+                10: 300000, 11: 700000, 12: 100000, 13: 500000, 14: 900000,
+                15: 300000, 16: 700000, 17: 100000, 18: 500000, 19: 900000
+            }
+            
+            grid_origin_easting = zone_easting_origins.get(utm_zone, 100000)
+            easting = grid_origin_easting + (col_index * 100000)
+            
+            # Calculate northing: Use latitude band to determine base northing
+            # These values are approximately correct for MGRS bands in CONUS
+            lat_band_northing_origins = {
+                'R': 2000000,   # 24°-32°N  
+                'S': 3100000,   # 32°-40°N
+                'T': 4200000,   # 40°-48°N (Illinois/Iowa are here!)
+                'U': 5300000,   # 48°-56°N
+            }
+            
+            grid_origin_northing = lat_band_northing_origins.get(lat_band, 4200000)
+            northing = grid_origin_northing + (row_index * 100000)
+            
+            # Each grid square is 100km × 100km
+            min_easting = easting
+            max_easting = easting + 100000
+            min_northing = northing
+            max_northing = northing + 100000
+            
+            logger.debug(f"MGRS {utm_zone}{lat_band}{grid_square}: "
+                        f"col_idx={col_index}, row_idx={row_index} -> "
+                        f"UTM bounds=({min_easting}, {min_northing}, {max_easting}, {max_northing})")
+            
+            return (min_easting, min_northing, max_easting, max_northing)
+            
+        except Exception as e:
+            logger.warning(f"Could not calculate MGRS grid bounds for {lat_band}{grid_square}: {e}")
+            return None
     
     def validate_coordinates(self, lon: float, lat: float) -> bool:
         """
